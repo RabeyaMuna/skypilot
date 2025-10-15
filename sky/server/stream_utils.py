@@ -25,6 +25,10 @@ logger = sky_logging.init_logger(__name__)
 _BUFFER_SIZE = 8 * 1024  # 8KB
 _BUFFER_TIMEOUT = 0.02  # 20ms
 _HEARTBEAT_INTERVAL = 30
+# If there is an issue during provisioning that causes the cluster to be stuck
+# in INIT state, we use this timeout to break the loop and stop streaming
+# provision logs.
+_PROVISION_LOG_TIMEOUT = 1
 
 LONG_REQUEST_POLL_INTERVAL = 1
 DEFAULT_POLL_INTERVAL = 0.1
@@ -234,14 +238,17 @@ async def _tail_log_file(
                 break
             # Provision logs pass in cluster_name, check cluster status
             # periodically to see if provisioning is done.
-            if cluster_name is not None and should_check_status:
-                last_status_check_time = current_time
-                cluster_record = await (
-                    global_user_state.get_status_from_cluster_name_async(
-                        cluster_name))
-                if (cluster_record is None or
-                        cluster_record != status_lib.ClusterStatus.INIT):
+            if cluster_name is not None:
+                if current_time - last_flush_time > _PROVISION_LOG_TIMEOUT:
                     break
+                if should_check_status:
+                    last_status_check_time = current_time
+                    cluster_record = await (
+                        global_user_state.get_status_from_cluster_name_async(
+                            cluster_name))
+                    if (cluster_record is None or
+                            cluster_record != status_lib.ClusterStatus.INIT):
+                        break
             if current_time - last_heartbeat_time >= _HEARTBEAT_INTERVAL:
                 # Currently just used to keep the connection busy, refer to
                 # https://github.com/skypilot-org/skypilot/issues/5750 for
