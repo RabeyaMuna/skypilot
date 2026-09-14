@@ -836,7 +836,8 @@ class Resources:
             image_size = self.cloud.get_image_size(image_id, region)
             if image_size >= self.disk_size:
                 with ux_utils.print_exception_no_traceback():
-                    size_compare = 'larger than' if image_size > self.disk_size \
+                    is_larger = image_size > self.disk_size
+                    size_compare = 'larger than' if is_larger \
                         else 'equal to'
                     raise ValueError(
                         f'Image {image_id!r} is {image_size}GB, which is '
@@ -904,14 +905,16 @@ class Resources:
                 # Docker config
                 # Docker image. The image name used to pull the image, e.g.
                 # ubuntu:latest.
-                'docker_image': docker_image,
+                'docker_image':
+                    docker_image,
                 # Docker container name. The name of the container. Default to
                 # `sky_container`.
                 'docker_container_name':
                     constants.DEFAULT_DOCKER_CONTAINER_NAME,
                 # Docker login config (if any). This helps pull the image from
                 # private registries.
-                'docker_login_config': self._docker_login_config
+                'docker_login_config':
+                    self._docker_login_config
             })
 
     def get_reservations_available_resources(
