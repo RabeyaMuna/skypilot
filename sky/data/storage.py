@@ -1,36 +1,22 @@
 """Storage and Store Classes for Sky Data."""
+
 import enum
 import os
 import re
 import subprocess
 import time
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import urllib.parse
+from typing import Any, Union
 
 import colorama
 
-from sky import check
-from sky import clouds
-from sky import exceptions
-from sky import global_user_state
-from sky import sky_logging
-from sky import status_lib
-from sky.adaptors import aws
-from sky.adaptors import cloudflare
-from sky.adaptors import gcp
-from sky.adaptors import ibm
-from sky.data import data_transfer
-from sky.data import data_utils
-from sky.data import mounting_utils
-from sky.data import sky_csync
-from sky.data import storage_utils
+from sky import check, clouds, exceptions, global_user_state, sky_logging, status_lib
+from sky.adaptors import aws, cloudflare, gcp, ibm
+from sky.data import data_transfer, data_utils, mounting_utils, sky_csync, storage_utils
 from sky.data.data_utils import Rclone
 from sky.data.storage_utils import StorageMode
-from sky.utils import common_utils
-from sky.utils import rich_utils
-from sky.utils import schemas
-from sky.utils import ux_utils
+from sky.utils import common_utils, rich_utils, schemas, ux_utils
 
 if typing.TYPE_CHECKING:
     import boto3  # type: ignore
@@ -41,57 +27,60 @@ logger = sky_logging.init_logger(__name__)
 StorageHandle = Any
 StorageStatus = status_lib.StorageStatus
 Path = str
-SourceType = Union[Path, List[Path]]
+SourceType = Union[Path, list[Path]]
 
 # Clouds with object storage implemented in this module. Azure Blob
 # Storage isn't supported yet (even though Azure is).
 # TODO(Doyoung): need to add clouds.CLOUDFLARE() to support
 # R2 to be an option as preferred store type
-STORE_ENABLED_CLOUDS: List[str] = [
+STORE_ENABLED_CLOUDS: list[str] = [
     str(clouds.AWS()),
     str(clouds.GCP()),
-    str(clouds.IBM()), cloudflare.NAME
+    str(clouds.IBM()),
+    cloudflare.NAME,
 ]
 
 # Maximum number of concurrent rsync upload processes
 _MAX_CONCURRENT_UPLOADS = 32
 
 _BUCKET_FAIL_TO_CONNECT_MESSAGE = (
-    'Failed to access existing bucket {name!r}. '
-    'This is likely because it is a private bucket you do not have access to.\n'
-    'To fix: \n'
-    '  1. If you are trying to create a new bucket: use a different name.\n'
-    '  2. If you are trying to connect to an existing bucket: make sure '
-    'your cloud credentials have access to it.')
+    "Failed to access existing bucket {name!r}. "
+    "This is likely because it is a private bucket you do not have access to.\n"
+    "To fix: \n"
+    "  1. If you are trying to create a new bucket: use a different name.\n"
+    "  2. If you are trying to connect to an existing bucket: make sure "
+    "your cloud credentials have access to it."
+)
 
 _BUCKET_EXTERNALLY_DELETED_DEBUG_MESSAGE = (
-    'Bucket {bucket_name!r} does not exist. '
-    'It may have been deleted externally.')
+    "Bucket {bucket_name!r} does not exist. It may have been deleted externally."
+)
 
 
-def _is_storage_cloud_enabled(cloud_name: str,
-                              try_fix_with_sky_check: bool = True) -> bool:
+def _is_storage_cloud_enabled(
+    cloud_name: str, try_fix_with_sky_check: bool = True
+) -> bool:
     enabled_storage_clouds = global_user_state.get_enabled_storage_clouds()
     if cloud_name in enabled_storage_clouds:
         return True
     if try_fix_with_sky_check:
         # TODO(zhwu): Only check the specified cloud to speed up.
         check.check(quiet=True)
-        return _is_storage_cloud_enabled(cloud_name,
-                                         try_fix_with_sky_check=False)
+        return _is_storage_cloud_enabled(cloud_name, try_fix_with_sky_check=False)
     return False
 
 
 class StoreType(enum.Enum):
     """Enum for the different types of stores."""
-    S3 = 'S3'
-    GCS = 'GCS'
-    AZURE = 'AZURE'
-    R2 = 'R2'
-    IBM = 'IBM'
+
+    S3 = "S3"
+    GCS = "GCS"
+    AZURE = "AZURE"
+    R2 = "R2"
+    IBM = "IBM"
 
     @classmethod
-    def from_cloud(cls, cloud: clouds.Cloud) -> 'StoreType':
+    def from_cloud(cls, cloud: clouds.Cloud) -> "StoreType":
         if isinstance(cloud, clouds.AWS):
             return StoreType.S3
         elif isinstance(cloud, clouds.GCP):
@@ -101,10 +90,10 @@ class StoreType(enum.Enum):
         elif isinstance(cloud, clouds.IBM):
             return StoreType.IBM
 
-        raise ValueError(f'Unsupported cloud for StoreType: {cloud}')
+        raise ValueError(f"Unsupported cloud for StoreType: {cloud}")
 
     @classmethod
-    def from_store(cls, store: 'AbstractStore') -> 'StoreType':
+    def from_store(cls, store: "AbstractStore") -> "StoreType":
         if isinstance(store, S3Store):
             return StoreType.S3
         elif isinstance(store, GcsStore):
@@ -115,7 +104,7 @@ class StoreType(enum.Enum):
             return StoreType.IBM
         else:
             with ux_utils.print_exception_no_traceback():
-                raise ValueError(f'Unknown store type: {store}')
+                raise ValueError(f"Unknown store type: {store}")
 
 
 def get_storetype_from_cloud(cloud: clouds.Cloud) -> StoreType:
@@ -127,34 +116,34 @@ def get_storetype_from_cloud(cloud: clouds.Cloud) -> StoreType:
         return StoreType.IBM
     elif isinstance(cloud, clouds.Azure):
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('Azure Blob Storage is not supported yet.')
+            raise ValueError("Azure Blob Storage is not supported yet.")
     elif isinstance(cloud, clouds.Lambda):
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('Lambda Cloud does not provide cloud storage.')
+            raise ValueError("Lambda Cloud does not provide cloud storage.")
     elif isinstance(cloud, clouds.SCP):
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('SCP does not provide cloud storage.')
+            raise ValueError("SCP does not provide cloud storage.")
     else:
         with ux_utils.print_exception_no_traceback():
-            raise ValueError(f'Unknown cloud type: {cloud}')
+            raise ValueError(f"Unknown cloud type: {cloud}")
 
 
 def get_store_prefix(storetype: StoreType) -> str:
     if storetype == StoreType.S3:
-        return 's3://'
+        return "s3://"
     elif storetype == StoreType.GCS:
-        return 'gs://'
+        return "gs://"
     # R2 storages use 's3://' as a prefix for various aws cli commands
     elif storetype == StoreType.R2:
-        return 's3://'
+        return "s3://"
     elif storetype == StoreType.IBM:
-        return 'cos://'
+        return "cos://"
     elif storetype == StoreType.AZURE:
         with ux_utils.print_exception_no_traceback():
-            raise ValueError('Azure Blob Storage is not supported yet.')
+            raise ValueError("Azure Blob Storage is not supported yet.")
     else:
         with ux_utils.print_exception_no_traceback():
-            raise ValueError(f'Unknown store type: {storetype}')
+            raise ValueError(f"Unknown store type: {storetype}")
 
 
 class AbstractStore:
@@ -165,9 +154,9 @@ class AbstractStore:
     present in a cloud.
     """
 
-    _STAT_CACHE_TTL = '5s'
+    _STAT_CACHE_TTL = "5s"
     _STAT_CACHE_CAPACITY = 4096
-    _TYPE_CACHE_TTL = '5s'
+    _TYPE_CACHE_TTL = "5s"
     _RENAME_DIR_LIMIT = 10000
 
     class StoreMetadata:
@@ -177,30 +166,36 @@ class AbstractStore:
         global_user_state.
         """
 
-        def __init__(self,
-                     *,
-                     name: str,
-                     source: Optional[SourceType],
-                     region: Optional[str] = None,
-                     is_sky_managed: Optional[bool] = None):
+        def __init__(
+            self,
+            *,
+            name: str,
+            source: SourceType | None,
+            region: str | None = None,
+            is_sky_managed: bool | None = None,
+        ):
             self.name = name
             self.source = source
             self.region = region
             self.is_sky_managed = is_sky_managed
 
         def __repr__(self):
-            return (f'StoreMetadata('
-                    f'\n\tname={self.name},'
-                    f'\n\tsource={self.source},'
-                    f'\n\tregion={self.region},'
-                    f'\n\tis_sky_managed={self.is_sky_managed})')
+            return (
+                f"StoreMetadata("
+                f"\n\tname={self.name},"
+                f"\n\tsource={self.source},"
+                f"\n\tregion={self.region},"
+                f"\n\tis_sky_managed={self.is_sky_managed})"
+            )
 
-    def __init__(self,
-                 name: str,
-                 source: Optional[SourceType],
-                 region: Optional[str] = None,
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: Optional[bool] = True):
+    def __init__(
+        self,
+        name: str,
+        source: SourceType | None,
+        region: str | None = None,
+        is_sky_managed: bool | None = None,
+        sync_on_reconstruction: bool | None = True,
+    ):
         """Initialize AbstractStore
 
         Args:
@@ -237,19 +232,21 @@ class AbstractStore:
         Used when reconstructing Storage and Store objects from
         global_user_state.
         """
-        return cls(name=override_args.get('name', metadata.name),
-                   source=override_args.get('source', metadata.source),
-                   region=override_args.get('region', metadata.region),
-                   is_sky_managed=override_args.get('is_sky_managed',
-                                                    metadata.is_sky_managed),
-                   sync_on_reconstruction=override_args.get(
-                       'sync_on_reconstruction', True))
+        return cls(
+            name=override_args.get("name", metadata.name),
+            source=override_args.get("source", metadata.source),
+            region=override_args.get("region", metadata.region),
+            is_sky_managed=override_args.get("is_sky_managed", metadata.is_sky_managed),
+            sync_on_reconstruction=override_args.get("sync_on_reconstruction", True),
+        )
 
     def get_metadata(self) -> StoreMetadata:
-        return self.StoreMetadata(name=self.name,
-                                  source=self.source,
-                                  region=self.region,
-                                  is_sky_managed=self.is_sky_managed)
+        return self.StoreMetadata(
+            name=self.name,
+            source=self.source,
+            region=self.region,
+            is_sky_managed=self.is_sky_managed,
+        )
 
     def initialize(self):
         """Initializes the Store object on the cloud.
@@ -262,11 +259,9 @@ class AbstractStore:
           StorageBucketGetError: If fetching existing bucket fails
           StorageInitError: If general initialization fails.
         """
-        pass
 
     def _validate(self) -> None:
         """Runs validation checks on class args"""
-        pass
 
     def upload(self) -> None:
         """Uploads source to the store bucket
@@ -314,9 +309,9 @@ class AbstractStore:
         """
         raise NotImplementedError
 
-    def csync_command(self,
-                      csync_path: str,
-                      interval_seconds: Optional[int] = None) -> str:
+    def csync_command(
+        self, csync_path: str, interval_seconds: int | None = None
+    ) -> str:
         """Returns command to mount CSYNC with Storage bucket on CSYNC_PATH.
 
         Args:
@@ -336,34 +331,38 @@ class AbstractStore:
             if self.source is not None:
                 if isinstance(self.source, (str, Path)):
                     if store_type == StoreType.GCS:
-                        destination = str(self.source).replace('gs://', '')
+                        destination = str(self.source).replace("gs://", "")
                     else:
                         destination = str(self.source).replace(
-                            f'{store_type_str}://', '')
+                            f"{store_type_str}://", ""
+                        )
                 elif isinstance(self.source, list):
                     raise TypeError(
-                        'CSYNC mode does not supprot multiple sources '
-                        'for a single storage.')
+                        "CSYNC mode does not supprot multiple sources "
+                        "for a single storage."
+                    )
         else:
             assert self.bucket is not None, (
-                'Bucket should be initialized before calling csync_command')
+                "Bucket should be initialized before calling csync_command"
+            )
             destination = self.bucket.name
 
         # Parse destination to get sync_point for log file naming
         # The exact mounting point is either the name of bucket
         # or the subdirectory in it
         result = urllib.parse.urlsplit(destination)
-        sync_point = result.path.split('/')[-1]
-        log_file_name = f'csync_{store_type_str}_{sync_point}.log'
-        log_path = f'~/.sky/{log_file_name}'
+        sync_point = result.path.split("/")[-1]
+        log_file_name = f"csync_{store_type_str}_{sync_point}.log"
+        log_path = f"~/.sky/{log_file_name}"
 
-        csync_cmd = (f'python -m sky.data.sky_csync csync {csync_path} '
-                     f'{store_type_str} {destination} --interval-seconds '
-                     f'{interval_seconds} --delete --no-follow-symlinks')
-        return mounting_utils.get_mounting_command(StorageMode.CSYNC,
-                                                   csync_path,
-                                                   csync_cmd,
-                                                   csync_log_path=log_path)
+        csync_cmd = (
+            f"python -m sky.data.sky_csync csync {csync_path} "
+            f"{store_type_str} {destination} --interval-seconds "
+            f"{interval_seconds} --delete --no-follow-symlinks"
+        )
+        return mounting_utils.get_mounting_command(
+            StorageMode.CSYNC, csync_path, csync_cmd, csync_log_path=log_path
+        )
 
     def __deepcopy__(self, memo):
         # S3 Client and GCS Client cannot be deep copied, hence the
@@ -371,7 +370,7 @@ class AbstractStore:
         return self
 
 
-class Storage(object):
+class Storage:
     """Storage objects handle persistent and large volume storage in the sky.
 
     Storage represents an abstract data store containing large data files
@@ -401,7 +400,7 @@ class Storage(object):
         storage.delete()
     """
 
-    class StorageMetadata(object):
+    class StorageMetadata:
         """A pickle-able tuple of:
 
         - (required) Storage name.
@@ -414,12 +413,11 @@ class Storage(object):
         def __init__(
             self,
             *,
-            storage_name: Optional[str],
-            source: Optional[SourceType],
-            interval_seconds: Optional[int],
-            mode: Optional[StorageMode] = None,
-            sky_stores: Optional[Dict[StoreType,
-                                      AbstractStore.StoreMetadata]] = None,
+            storage_name: str | None,
+            source: SourceType | None,
+            interval_seconds: int | None,
+            mode: StorageMode | None = None,
+            sky_stores: dict[StoreType, AbstractStore.StoreMetadata] | None = None,
         ):
             assert storage_name is not None or source is not None
             self.storage_name = storage_name
@@ -431,12 +429,14 @@ class Storage(object):
             self.sky_stores = {} if sky_stores is None else sky_stores
 
         def __repr__(self):
-            return (f'StorageMetadata('
-                    f'\n\tstorage_name={self.storage_name},'
-                    f'\n\tsource={self.source},'
-                    f'\n\tinterval_seconds={self.interval_seconds},'
-                    f'\n\tmode={self.mode},'
-                    f'\n\tstores={self.sky_stores})')
+            return (
+                f"StorageMetadata("
+                f"\n\tstorage_name={self.storage_name},"
+                f"\n\tsource={self.source},"
+                f"\n\tinterval_seconds={self.interval_seconds},"
+                f"\n\tmode={self.mode},"
+                f"\n\tstores={self.sky_stores})"
+            )
 
         def add_store(self, store: AbstractStore) -> None:
             storetype = StoreType.from_store(store)
@@ -447,14 +447,16 @@ class Storage(object):
             if storetype in self.sky_stores:
                 del self.sky_stores[storetype]
 
-    def __init__(self,
-                 name: Optional[str] = None,
-                 source: Optional[SourceType] = None,
-                 stores: Optional[Dict[StoreType, AbstractStore]] = None,
-                 persistent: Optional[bool] = True,
-                 mode: StorageMode = StorageMode.MOUNT,
-                 interval_seconds: Optional[int] = None,
-                 sync_on_reconstruction: bool = True) -> None:
+    def __init__(
+        self,
+        name: str | None = None,
+        source: SourceType | None = None,
+        stores: dict[StoreType, AbstractStore] | None = None,
+        persistent: bool | None = True,
+        mode: StorageMode = StorageMode.MOUNT,
+        interval_seconds: int | None = None,
+        sync_on_reconstruction: bool = True,
+    ) -> None:
         """Initializes a Storage object.
 
         Three fields are required: the name of the storage, the source
@@ -521,52 +523,53 @@ class Storage(object):
         if handle is not None:
             self.handle = handle
             # Reconstruct the Storage object from the global_user_state
-            logger.debug('Detected existing storage object, '
-                         f'loading Storage: {self.name}')
+            logger.debug(
+                f"Detected existing storage object, loading Storage: {self.name}"
+            )
             self._add_store_from_metadata(self.handle.sky_stores)
 
             # TODO(romilb): This logic should likely be in add_store to move
             # syncing to file_mount stage..
             if self.sync_on_reconstruction:
-                msg = ''
-                if (self.source and
-                    (isinstance(self.source, list) or
-                     not data_utils.is_cloud_store_url(self.source))):
-                    msg = ' and uploading from source'
-                logger.info(f'Verifying bucket{msg} for storage {self.name}')
+                msg = ""
+                if self.source and (
+                    isinstance(self.source, list)
+                    or not data_utils.is_cloud_store_url(self.source)
+                ):
+                    msg = " and uploading from source"
+                logger.info(f"Verifying bucket{msg} for storage {self.name}")
                 self.sync_all_stores()
 
         else:
             # Storage does not exist in global_user_state, create new stores
             sky_managed_stores = {
-                t: s.get_metadata()
-                for t, s in self.stores.items()
-                if s.is_sky_managed
+                t: s.get_metadata() for t, s in self.stores.items() if s.is_sky_managed
             }
             self.handle = self.StorageMetadata(
                 storage_name=self.name,
                 source=self.source,
                 interval_seconds=self.interval_seconds,
                 mode=self.mode,
-                sky_stores=sky_managed_stores)
+                sky_stores=sky_managed_stores,
+            )
 
             if self.source is not None:
                 # If source is a pre-existing bucket, connect to the bucket
                 # If the bucket does not exist, this will error out
                 if isinstance(self.source, str):
-                    if self.source.startswith('s3://'):
+                    if self.source.startswith("s3://"):
                         self.add_store(StoreType.S3)
-                    elif self.source.startswith('gs://'):
+                    elif self.source.startswith("gs://"):
                         self.add_store(StoreType.GCS)
-                    elif self.source.startswith('r2://'):
+                    elif self.source.startswith("r2://"):
                         self.add_store(StoreType.R2)
-                    elif self.source.startswith('cos://'):
+                    elif self.source.startswith("cos://"):
                         self.add_store(StoreType.IBM)
 
     @staticmethod
     def _validate_source(
-            source: SourceType, mode: StorageMode,
-            sync_on_reconstruction: bool) -> Tuple[SourceType, bool]:
+        source: SourceType, mode: StorageMode, sync_on_reconstruction: bool
+    ) -> tuple[SourceType, bool]:
         """Validates the source path.
 
         Args:
@@ -582,37 +585,41 @@ class Storage(object):
             False if URI.
         """
 
-        def _check_basename_conflicts(source_list: List[str]) -> None:
+        def _check_basename_conflicts(source_list: list[str]) -> None:
             """Checks if two paths in source_list have the same basename."""
             basenames = [os.path.basename(s) for s in source_list]
             conflicts = {x for x in basenames if basenames.count(x) > 1}
             if conflicts:
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageSourceError(
-                        'Cannot have multiple files or directories with the '
-                        'same name in source. Conflicts found for: '
-                        f'{", ".join(conflicts)}')
+                        "Cannot have multiple files or directories with the "
+                        "same name in source. Conflicts found for: "
+                        f"{', '.join(conflicts)}"
+                    )
 
         def _validate_local_source(local_source):
-            if local_source.endswith('/'):
+            if local_source.endswith("/"):
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageSourceError(
-                        'Storage source paths cannot end with a slash '
+                        "Storage source paths cannot end with a slash "
                         '(try "/mydir: /mydir" or "/myfile: /myfile"). '
-                        f'Found source={local_source}')
+                        f"Found source={local_source}"
+                    )
             # Local path, check if it exists
             full_src = os.path.abspath(os.path.expanduser(local_source))
             # Only check if local source exists if it is synced to the bucket
             if not os.path.exists(full_src) and sync_on_reconstruction:
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageSourceError(
-                        'Local source path does not'
-                        f' exist: {local_source}')
+                        f"Local source path does not exist: {local_source}"
+                    )
             # Raise warning if user's path is a symlink
             elif os.path.islink(full_src):
-                logger.warning(f'Source path {source} is a symlink. '
-                               'Referenced contents are uploaded, matching '
-                               'the default behavior for S3 and GCS syncing.')
+                logger.warning(
+                    f"Source path {source} is a symlink. "
+                    "Referenced contents are uploaded, matching "
+                    "the default behavior for S3 and GCS syncing."
+                )
 
         # Check if source is a list of paths
         if isinstance(source, list):
@@ -625,79 +632,87 @@ class Storage(object):
         else:
             # Check if str source is a valid local/remote URL
             split_path = urllib.parse.urlsplit(source)
-            if split_path.scheme == '':
+            if split_path.scheme == "":
                 _validate_local_source(source)
                 # Check if source is a file - throw error if it is
                 full_src = os.path.abspath(os.path.expanduser(source))
                 if os.path.isfile(full_src):
                     with ux_utils.print_exception_no_traceback():
                         raise exceptions.StorageSourceError(
-                            'Storage source path cannot be a file - only'
-                            ' directories are supported as a source. '
-                            'To upload a single file, specify it in a list '
-                            f'by writing source: [{source}]. Note '
-                            'that the file will be uploaded to the root of the '
-                            'bucket and will appear at <destination_path>/'
-                            f'{os.path.basename(source)}. Alternatively, you '
-                            'can directly upload the file to the VM without '
-                            'using a bucket by writing <destination_path>: '
-                            f'{source} in the file_mounts section of your YAML')
+                            "Storage source path cannot be a file - only"
+                            " directories are supported as a source. "
+                            "To upload a single file, specify it in a list "
+                            f"by writing source: [{source}]. Note "
+                            "that the file will be uploaded to the root of the "
+                            "bucket and will appear at <destination_path>/"
+                            f"{os.path.basename(source)}. Alternatively, you "
+                            "can directly upload the file to the VM without "
+                            "using a bucket by writing <destination_path>: "
+                            f"{source} in the file_mounts section of your YAML"
+                        )
                 is_local_source = True
-            elif split_path.scheme in ['s3', 'gs', 'r2', 'cos']:
+            elif split_path.scheme in ["s3", "gs", "r2", "cos"]:
                 is_local_source = False
                 # Storage mounting does not support mounting specific files from
                 # cloud store - ensure path points to only a directory
                 if mode == StorageMode.MOUNT:
-                    if ((not split_path.scheme == 'cos' and
-                         split_path.path.strip('/') != '') or
-                        (split_path.scheme == 'cos' and
-                         not re.match(r'^/[-\w]+(/\s*)?$', split_path.path))):
+                    if (
+                        not split_path.scheme == "cos"
+                        and split_path.path.strip("/") != ""
+                    ) or (
+                        split_path.scheme == "cos"
+                        and not re.match(r"^/[-\w]+(/\s*)?$", split_path.path)
+                    ):
                         # regex allows split_path.path to include /bucket
                         # or /bucket/optional_whitespaces while considering
                         # cos URI's regions (cos://region/bucket_name)
                         with ux_utils.print_exception_no_traceback():
                             raise exceptions.StorageModeError(
-                                'MOUNT mode does not support'
-                                ' mounting specific files from cloud'
-                                ' storage. Please use COPY mode or'
-                                ' specify only the bucket name as'
-                                ' the source.')
+                                "MOUNT mode does not support"
+                                " mounting specific files from cloud"
+                                " storage. Please use COPY mode or"
+                                " specify only the bucket name as"
+                                " the source."
+                            )
             else:
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageSourceError(
-                        f'Supported paths: local, s3://, gs://, '
-                        f'r2://, cos://. Got: {source}')
+                        f"Supported paths: local, s3://, gs://, "
+                        f"r2://, cos://. Got: {source}"
+                    )
         return source, is_local_source
 
-    def _validate_storage_spec(self, name: Optional[str]) -> None:
+    def _validate_storage_spec(self, name: str | None) -> None:
         """Validates the storage spec and updates local fields if necessary."""
 
         def validate_name(name):
-            """ Checks for validating the storage name.
+            """Checks for validating the storage name.
 
             Checks if the name starts the s3, gcs or r2 prefix and raise error
             if it does. Store specific validation checks (e.g., S3 specific
             rules) happen in the corresponding store class.
             """
-            prefix = name.split('://')[0]
+            prefix = name.split("://")[0]
             prefix = prefix.lower()
-            if prefix in ['s3', 'gs', 'r2', 'cos']:
+            if prefix in ["s3", "gs", "r2", "cos"]:
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageNameError(
-                        'Prefix detected: `name` cannot start with '
-                        f'{prefix}://. If you are trying to use an existing '
-                        'bucket created outside of SkyPilot, please specify it '
-                        'using the `source` field (e.g. '
-                        '`source: s3://mybucket/`). If you are trying to '
-                        'create a new bucket, please use the `store` field to '
-                        'specify the store type (e.g. `store: s3`).')
+                        "Prefix detected: `name` cannot start with "
+                        f"{prefix}://. If you are trying to use an existing "
+                        "bucket created outside of SkyPilot, please specify it "
+                        "using the `source` field (e.g. "
+                        "`source: s3://mybucket/`). If you are trying to "
+                        "create a new bucket, please use the `store` field to "
+                        "specify the store type (e.g. `store: s3`)."
+                    )
 
         # interval_seconds is a field only used with CSYNC mode
         if self.mode != StorageMode.CSYNC and self.interval_seconds is not None:
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageSourceError(
                     'The field "interval_seconds" can be specified only '
-                    'with CSYNC mdoe.')
+                    "with CSYNC mode."
+                )
 
         if self.source is None:
             # If the mode is COPY, the source must be specified
@@ -710,8 +725,9 @@ class Storage(object):
                 if handle is None:
                     with ux_utils.print_exception_no_traceback():
                         raise exceptions.StorageSourceError(
-                            'New storage object: source must be specified when '
-                            'using COPY mode.')
+                            "New storage object: source must be specified when "
+                            "using COPY mode."
+                        )
             else:
                 # If source is not specified in COPY mode, the intent is to
                 # create a bucket and use it as scratch disk. Name must be
@@ -719,24 +735,26 @@ class Storage(object):
                 if not name:
                     with ux_utils.print_exception_no_traceback():
                         raise exceptions.StorageSpecError(
-                            'Storage source or storage name must be specified.')
+                            "Storage source or storage name must be specified."
+                        )
             assert name is not None, handle
             validate_name(name)
             self.name = name
             return
         elif self.source is not None:
             source, is_local_source = Storage._validate_source(
-                self.source, self.mode, self.sync_on_reconstruction)
+                self.source, self.mode, self.sync_on_reconstruction
+            )
             if not name:
                 if is_local_source:
                     with ux_utils.print_exception_no_traceback():
                         raise exceptions.StorageNameError(
-                            'Storage name must be specified if the source is '
-                            'local.')
+                            "Storage name must be specified if the source is local."
+                        )
                 else:
                     assert isinstance(source, str)
                     # Set name to source bucket name and continue
-                    if source.startswith('cos://'):
+                    if source.startswith("cos://"):
                         # cos url requires custom parsing
                         name = data_utils.split_cos_path(source)[0]
                     else:
@@ -756,15 +774,17 @@ class Storage(object):
                     # is a URI. Name will be inferred from the URI.
                     with ux_utils.print_exception_no_traceback():
                         raise exceptions.StorageSpecError(
-                            'Storage name should not be specified if the '
-                            'source is a remote URI.')
+                            "Storage name should not be specified if the "
+                            "source is a remote URI."
+                        )
         raise exceptions.StorageSpecError(
-            f'Validation failed for storage source {self.source}, name '
-            f'{self.name} and mode {self.mode}. Please check the arguments.')
+            f"Validation failed for storage source {self.source}, name "
+            f"{self.name} and mode {self.mode}. Please check the arguments."
+        )
 
     def _add_store_from_metadata(
-            self, sky_stores: Dict[StoreType,
-                                   AbstractStore.StoreMetadata]) -> None:
+        self, sky_stores: dict[StoreType, AbstractStore.StoreMetadata]
+    ) -> None:
         """Reconstructs Storage.stores from sky_stores.
 
         Reconstruct AbstractStore objects from sky_store's metadata and
@@ -778,69 +798,75 @@ class Storage(object):
                     store = S3Store.from_metadata(
                         s_metadata,
                         source=self.source,
-                        sync_on_reconstruction=self.sync_on_reconstruction)
+                        sync_on_reconstruction=self.sync_on_reconstruction,
+                    )
                 elif s_type == StoreType.GCS:
                     store = GcsStore.from_metadata(
                         s_metadata,
                         source=self.source,
-                        sync_on_reconstruction=self.sync_on_reconstruction)
+                        sync_on_reconstruction=self.sync_on_reconstruction,
+                    )
                 elif s_type == StoreType.R2:
                     store = R2Store.from_metadata(
                         s_metadata,
                         source=self.source,
-                        sync_on_reconstruction=self.sync_on_reconstruction)
+                        sync_on_reconstruction=self.sync_on_reconstruction,
+                    )
                 elif s_type == StoreType.IBM:
                     store = IBMCosStore.from_metadata(
                         s_metadata,
                         source=self.source,
-                        sync_on_reconstruction=self.sync_on_reconstruction)
+                        sync_on_reconstruction=self.sync_on_reconstruction,
+                    )
                 else:
                     with ux_utils.print_exception_no_traceback():
-                        raise ValueError(f'Unknown store type: {s_type}')
+                        raise ValueError(f"Unknown store type: {s_type}")
             # Following error is raised from _get_bucket and caught only when
             # an externally removed storage is attempted to be fetched.
             except exceptions.StorageExternalDeletionError:
-                logger.debug(f'Storage object, {self.name}, was attempted to '
-                             'be reconstructed while the corresponding bucket'
-                             ' was externally deleted.')
+                logger.debug(
+                    f"Storage object, {self.name}, was attempted to "
+                    "be reconstructed while the corresponding bucket"
+                    " was externally deleted."
+                )
                 continue
 
             self._add_store(store, is_reconstructed=True)
 
     @classmethod
-    def from_metadata(cls, metadata: StorageMetadata,
-                      **override_args) -> 'Storage':
+    def from_metadata(cls, metadata: StorageMetadata, **override_args) -> "Storage":
         """Create Storage from StorageMetadata object.
 
         Used when reconstructing Storage object and AbstractStore objects from
         global_user_state.
         """
         # Name should not be specified if the source is a cloud store URL.
-        source = override_args.get('source', metadata.source)
-        name = override_args.get('name', metadata.storage_name)
+        source = override_args.get("source", metadata.source)
+        name = override_args.get("name", metadata.storage_name)
         # If the source is a list, it consists of local paths
-        if not isinstance(source, list): 
+        if not isinstance(source, list):
             if data_utils.is_cloud_store_url(source):
                 name = None
 
-        storage_obj = cls(name=name,
-                          source=source,
-                          sync_on_reconstruction=override_args.get(
-                              'sync_on_reconstruction', True))
+        storage_obj = cls(
+            name=name,
+            source=source,
+            sync_on_reconstruction=override_args.get("sync_on_reconstruction", True),
+        )
 
         # For backward compatibility
         # TODO(Doyoung): Implement __setstate__ to resolve backwards
         # compatibility issue
-        if hasattr(metadata, 'interval_seconds'):
+        if hasattr(metadata, "interval_seconds"):
             storage_obj.interval_seconds = metadata.interval_seconds
 
-        if hasattr(metadata, 'mode'):
+        if hasattr(metadata, "mode"):
             if metadata.mode:
-                storage_obj.mode = override_args.get('mode', metadata.mode)
+                storage_obj.mode = override_args.get("mode", metadata.mode)
 
         return storage_obj
 
-    def add_store(self, store_type: Union[str, StoreType]) -> AbstractStore:
+    def add_store(self, store_type: str | StoreType) -> AbstractStore:
         """Initializes and adds a new store to the storage.
 
         Invoked by the optimizer after it has selected a store to
@@ -853,10 +879,10 @@ class Storage(object):
             store_type = StoreType(store_type)
 
         if store_type in self.stores:
-            logger.info(f'Storage type {store_type} already exists.')
+            logger.info(f"Storage type {store_type} already exists.")
             return self.stores[store_type]
 
-        store_cls: Type[AbstractStore]
+        store_cls: type[AbstractStore]
         if store_type == StoreType.S3:
             store_cls = S3Store
         elif store_type == StoreType.GCS:
@@ -868,37 +894,38 @@ class Storage(object):
         else:
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageSpecError(
-                    f'{store_type} not supported as a Store.')
+                    f"{store_type} not supported as a Store."
+                )
 
         if self.mode == StorageMode.CSYNC:
             if store_type in (StoreType.R2, StoreType.IBM):
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageSpecError(
-                        f'Currently, {store_type} does not support '
-                        'CSYNC mode.')
+                        f"Currently, {store_type} does not support CSYNC mode."
+                    )
 
         # Initialize store object and get/create bucket
         try:
             store = store_cls(
                 name=self.name,
                 source=self.source,
-                sync_on_reconstruction=self.sync_on_reconstruction)
+                sync_on_reconstruction=self.sync_on_reconstruction,
+            )
         except exceptions.StorageBucketCreateError:
             # Creation failed, so this must be sky managed store. Add failure
             # to state.
-            logger.error(f'Could not create {store_type} store '
-                         f'with name {self.name}.')
-            global_user_state.set_storage_status(self.name,
-                                                 StorageStatus.INIT_FAILED)
+            logger.error(f"Could not create {store_type} store with name {self.name}.")
+            global_user_state.set_storage_status(self.name, StorageStatus.INIT_FAILED)
             raise
         except exceptions.StorageBucketGetError:
             # Bucket get failed, so this is not sky managed. Do not update state
-            logger.error(f'Could not get {store_type} store '
-                         f'with name {self.name}.')
+            logger.error(f"Could not get {store_type} store with name {self.name}.")
             raise
         except exceptions.StorageInitError:
-            logger.error(f'Could not initialize {store_type} store with '
-                         f'name {self.name}. General initialization error.')
+            logger.error(
+                f"Could not initialize {store_type} store with "
+                f"name {self.name}. General initialization error."
+            )
             raise
 
         # Add store to storage
@@ -917,10 +944,11 @@ class Storage(object):
         if store.is_sky_managed:
             self.handle.add_store(store)
             if not is_reconstructed:
-                global_user_state.add_or_update_storage(self.name, self.handle,
-                                                        StorageStatus.INIT)
+                global_user_state.add_or_update_storage(
+                    self.name, self.handle, StorageStatus.INIT
+                )
 
-    def delete(self, store_type: Optional[StoreType] = None) -> None:
+    def delete(self, store_type: StoreType | None = None) -> None:
         """Deletes data for all sky-managed storage objects.
 
         If a storage is not managed by sky, it is not deleted from the cloud.
@@ -931,7 +959,7 @@ class Storage(object):
               of backing stores.
         """
         if not self.stores:
-            logger.info('No backing stores found. Deleting storage.')
+            logger.info("No backing stores found. Deleting storage.")
             global_user_state.remove_storage(self.name)
         if store_type:
             store = self.stores[store_type]
@@ -943,8 +971,7 @@ class Storage(object):
                 store.delete()
                 # Check remaining stores - if none is sky managed, remove
                 # the storage from global_user_state.
-                delete = all(
-                    s.is_sky_managed is False for s in self.stores.values())
+                delete = all(s.is_sky_managed is False for s in self.stores.values())
                 if delete:
                     global_user_state.remove_storage(self.name)
                 else:
@@ -973,9 +1000,10 @@ class Storage(object):
         """Runs the upload routine for the store and handles failures"""
 
         def warn_for_git_dir(source: str):
-            if os.path.isdir(os.path.join(source, '.git')):
-                logger.warning(f'\'.git\' directory under \'{self.source}\' '
-                               'is excluded during sync.')
+            if os.path.isdir(os.path.join(source, ".git")):
+                logger.warning(
+                    f"'.git' directory under '{self.source}' is excluded during sync."
+                )
 
         try:
             if self.source is not None:
@@ -986,11 +1014,13 @@ class Storage(object):
                         warn_for_git_dir(source)
             store.upload()
         except exceptions.StorageUploadError:
-            logger.error(f'Could not upload {self.source!r} to store '
-                         f'name {store.name!r}.')
+            logger.error(
+                f"Could not upload {self.source!r} to store name {store.name!r}."
+            )
             if store.is_sky_managed:
                 global_user_state.set_storage_status(
-                    self.name, StorageStatus.UPLOAD_FAILED)
+                    self.name, StorageStatus.UPLOAD_FAILED
+                )
             raise
 
         # Upload succeeded - update state
@@ -998,16 +1028,17 @@ class Storage(object):
             global_user_state.set_storage_status(self.name, StorageStatus.READY)
 
     @classmethod
-    def from_yaml_config(cls, config: Dict[str, Any]) -> 'Storage':
-        common_utils.validate_schema(config, schemas.get_storage_schema(),
-                                     'Invalid storage YAML: ')
+    def from_yaml_config(cls, config: dict[str, Any]) -> "Storage":
+        common_utils.validate_schema(
+            config, schemas.get_storage_schema(), "Invalid storage YAML: "
+        )
 
-        name = config.pop('name', None)
-        source = config.pop('source', None)
-        store = config.pop('store', None)
-        mode_str = config.pop('mode', None)
-        interval_seconds = config.pop('interval_seconds', None)
-        force_delete = config.pop('_force_delete', None)
+        name = config.pop("name", None)
+        source = config.pop("source", None)
+        store = config.pop("store", None)
+        mode_str = config.pop("mode", None)
+        interval_seconds = config.pop("interval_seconds", None)
+        force_delete = config.pop("_force_delete", None)
         if force_delete is None:
             force_delete = False
 
@@ -1017,18 +1048,20 @@ class Storage(object):
         else:
             # Make sure this keeps the same as the default mode in __init__
             mode = StorageMode.MOUNT
-        persistent = config.pop('persistent', None)
+        persistent = config.pop("persistent", None)
         if persistent is None:
             persistent = True
 
-        assert not config, f'Invalid storage args: {config.keys()}'
+        assert not config, f"Invalid storage args: {config.keys()}"
 
         # Validation of the config object happens on instantiation.
-        storage_obj = cls(name=name,
-                          source=source,
-                          persistent=persistent,
-                          mode=mode,
-                          interval_seconds=interval_seconds)
+        storage_obj = cls(
+            name=name,
+            source=source,
+            persistent=persistent,
+            mode=mode,
+            interval_seconds=interval_seconds,
+        )
         if store is not None:
             storage_obj.add_store(StoreType(store.upper()))
 
@@ -1036,30 +1069,33 @@ class Storage(object):
         storage_obj.force_delete = force_delete
         return storage_obj
 
-    def to_yaml_config(self) -> Dict[str, str]:
+    def to_yaml_config(self) -> dict[str, str]:
         config = {}
 
-        def add_if_not_none(key: str, value: Optional[Any]):
+        def add_if_not_none(key: str, value: Any | None):
             if value is not None:
                 config[key] = value
 
         name = None
-        if (self.source is None or not isinstance(self.source, str) or
-                not data_utils.is_cloud_store_url(self.source)):
+        if (
+            self.source is None
+            or not isinstance(self.source, str)
+            or not data_utils.is_cloud_store_url(self.source)
+        ):
             # Remove name if source is a cloud store URL
             name = self.name
-        add_if_not_none('name', name)
-        add_if_not_none('source', self.source)
+        add_if_not_none("name", name)
+        add_if_not_none("source", self.source)
 
         stores = None
         if len(self.stores) > 0:
-            stores = ','.join([store.value for store in self.stores])
-        add_if_not_none('store', stores)
-        add_if_not_none('persistent', self.persistent)
-        add_if_not_none('mode', self.mode.value)
-        add_if_not_none('interval_seconds', self.interval_seconds)
+            stores = ",".join([store.value for store in self.stores])
+        add_if_not_none("store", stores)
+        add_if_not_none("persistent", self.persistent)
+        add_if_not_none("mode", self.mode.value)
+        add_if_not_none("interval_seconds", self.interval_seconds)
         if self.force_delete:
-            config['_force_delete'] = True
+            config["_force_delete"] = True
         return config
 
     def get_storage_name(self):
@@ -1071,46 +1107,54 @@ class S3Store(AbstractStore):
     for S3 buckets.
     """
 
-    _ACCESS_DENIED_MESSAGE = 'Access Denied'
+    _ACCESS_DENIED_MESSAGE = "Access Denied"
 
-    def __init__(self,
-                 name: str,
-                 source: str,
-                 region: Optional[str] = 'us-east-2',
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: bool = True):
-        self.client: 'boto3.client.Client'
-        self.bucket: 'StorageHandle'
-        super().__init__(name, source, region, is_sky_managed,
-                         sync_on_reconstruction)
+    def __init__(
+        self,
+        name: str,
+        source: str,
+        region: str | None = "us-east-2",
+        is_sky_managed: bool | None = None,
+        sync_on_reconstruction: bool = True,
+    ):
+        self.client: boto3.client.Client
+        self.bucket: StorageHandle
+        super().__init__(name, source, region, is_sky_managed, sync_on_reconstruction)
 
     def _validate(self):
         if self.source is not None and isinstance(self.source, str):
-            if self.source.startswith('s3://'):
+            if self.source.startswith("s3://"):
                 assert self.name == data_utils.split_s3_path(self.source)[0], (
-                    'S3 Bucket is specified as path, the name should be the'
-                    ' same as S3 bucket.')
-            elif self.source.startswith('gs://'):
+                    "S3 Bucket is specified as path, the name should be the"
+                    " same as S3 bucket."
+                )
+            elif self.source.startswith("gs://"):
                 assert self.name == data_utils.split_gcs_path(self.source)[0], (
-                    'GCS Bucket is specified as path, the name should be '
-                    'the same as GCS bucket.')
+                    "GCS Bucket is specified as path, the name should be "
+                    "the same as GCS bucket."
+                )
                 assert data_utils.verify_gcs_bucket(self.name), (
-                    f'Source specified as {self.source}, a GCS bucket. ',
-                    'GCS Bucket should exist.')
-            elif self.source.startswith('r2://'):
+                    f"Source specified as {self.source}, a GCS bucket. ",
+                    "GCS Bucket should exist.",
+                )
+            elif self.source.startswith("r2://"):
                 assert self.name == data_utils.split_r2_path(self.source)[0], (
-                    'R2 Bucket is specified as path, the name should be '
-                    'the same as R2 bucket.')
+                    "R2 Bucket is specified as path, the name should be "
+                    "the same as R2 bucket."
+                )
                 assert data_utils.verify_r2_bucket(self.name), (
-                    f'Source specified as {self.source}, a R2 bucket. ',
-                    'R2 Bucket should exist.')
-            elif self.source.startswith('cos://'):
+                    f"Source specified as {self.source}, a R2 bucket. ",
+                    "R2 Bucket should exist.",
+                )
+            elif self.source.startswith("cos://"):
                 assert self.name == data_utils.split_cos_path(self.source)[0], (
-                    'COS Bucket is specified as path, the name should be '
-                    'the same as COS bucket.')
+                    "COS Bucket is specified as path, the name should be "
+                    "the same as COS bucket."
+                )
                 assert data_utils.verify_ibm_cos_bucket(self.name), (
-                    f'Source specified as {self.source}, a COS bucket. ',
-                    'COS Bucket should exist.')
+                    f"Source specified as {self.source}, a COS bucket. ",
+                    "COS Bucket should exist.",
+                )
         # Validate name
         self.name = self.validate_name(self.name)
 
@@ -1118,11 +1162,11 @@ class S3Store(AbstractStore):
         if not _is_storage_cloud_enabled(str(clouds.AWS())):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.ResourcesUnavailableError(
-                    'Storage \'store: s3\' specified, but ' \
-                    'AWS access is disabled. To fix, enable '\
-                    'AWS by running `sky check`. More info: '\
-                    'https://skypilot.readthedocs.io/en/latest/getting-started/installation.html.' # pylint: disable=line-too-long
-                    )
+                    "Storage 'store: s3' specified, but "
+                    "AWS access is disabled. To fix, enable "
+                    "AWS by running `sky check`. More info: "
+                    "https://skypilot.readthedocs.io/en/latest/getting-started/installation.html."  # pylint: disable=line-too-long
+                )
 
     @classmethod
     def validate_name(cls, name) -> str:
@@ -1138,49 +1182,56 @@ class S3Store(AbstractStore):
         if name is not None and isinstance(name, str):
             if not 3 <= len(name) <= 63:
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must be between 3 (min) '
-                    'and 63 (max) characters long.')
+                    f"Invalid store name: name {name} must be between 3 (min) "
+                    "and 63 (max) characters long."
+                )
 
             # Check for valid characters and start/end with a letter or number
-            pattern = r'^[a-z0-9][-a-z0-9.]*[a-z0-9]$'
+            pattern = r"^[a-z0-9][-a-z0-9.]*[a-z0-9]$"
             if not re.match(pattern, name):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} can consist only of '
-                    'lowercase letters, numbers, dots (.), and hyphens (-). '
-                    'It must begin and end with a letter or number.')
+                    f"Invalid store name: name {name} can consist only of "
+                    "lowercase letters, numbers, dots (.), and hyphens (-). "
+                    "It must begin and end with a letter or number."
+                )
 
             # Check for two adjacent periods
-            if '..' in name:
+            if ".." in name:
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must not contain '
-                    'two adjacent periods.')
+                    f"Invalid store name: name {name} must not contain "
+                    "two adjacent periods."
+                )
 
             # Check for IP address format
-            ip_pattern = r'^(?:\d{1,3}\.){3}\d{1,3}$'
+            ip_pattern = r"^(?:\d{1,3}\.){3}\d{1,3}$"
             if re.match(ip_pattern, name):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must not be formatted as '
-                    'an IP address (for example, 192.168.5.4).')
+                    f"Invalid store name: name {name} must not be formatted as "
+                    "an IP address (for example, 192.168.5.4)."
+                )
 
             # Check for 'xn--' prefix
-            if name.startswith('xn--'):
+            if name.startswith("xn--"):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must not start with the '
-                    'prefix "xn--".')
+                    f"Invalid store name: name {name} must not start with the "
+                    'prefix "xn--".'
+                )
 
             # Check for '-s3alias' suffix
-            if name.endswith('-s3alias'):
+            if name.endswith("-s3alias"):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must not end with the '
-                    'suffix "-s3alias".')
+                    f"Invalid store name: name {name} must not end with the "
+                    'suffix "-s3alias".'
+                )
 
             # Check for '--ol-s3' suffix
-            if name.endswith('--ol-s3'):
+            if name.endswith("--ol-s3"):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must not end with the '
-                    'suffix "--ol-s3".')
+                    f"Invalid store name: name {name} must not end with the "
+                    'suffix "--ol-s3".'
+                )
         else:
-            _raise_no_traceback_name_error('Store name must be specified.')
+            _raise_no_traceback_name_error("Store name must be specified.")
         return name
 
     def initialize(self):
@@ -1216,11 +1267,9 @@ class S3Store(AbstractStore):
             if isinstance(self.source, list):
                 self.batch_aws_rsync(self.source, create_dirs=True)
             elif self.source is not None:
-                if self.source.startswith('s3://'):
+                if self.source.startswith("s3://"):
                     pass
-                elif self.source.startswith('gs://'):
-                    self._transfer_to_s3()
-                elif self.source.startswith('r2://'):
+                elif self.source.startswith("gs://") or self.source.startswith("r2://"):
                     self._transfer_to_s3()
                 else:
                     self.batch_aws_rsync([self.source])
@@ -1228,24 +1277,26 @@ class S3Store(AbstractStore):
             raise
         except Exception as e:
             raise exceptions.StorageUploadError(
-                f'Upload failed for store {self.name}') from e
+                f"Upload failed for store {self.name}"
+            ) from e
 
     def delete(self) -> None:
         deleted_by_skypilot = self._delete_s3_bucket(self.name)
         if deleted_by_skypilot:
-            msg_str = f'Deleted S3 bucket {self.name}.'
+            msg_str = f"Deleted S3 bucket {self.name}."
         else:
-            msg_str = f'S3 bucket {self.name} may have been deleted ' \
-                      f'externally. Removing from local state.'
-        logger.info(f'{colorama.Fore.GREEN}{msg_str}'
-                    f'{colorama.Style.RESET_ALL}')
+            msg_str = (
+                f"S3 bucket {self.name} may have been deleted "
+                f"externally. Removing from local state."
+            )
+        logger.info(f"{colorama.Fore.GREEN}{msg_str}{colorama.Style.RESET_ALL}")
 
     def get_handle(self) -> StorageHandle:
-        return aws.resource('s3').Bucket(self.name)
+        return aws.resource("s3").Bucket(self.name)
 
-    def batch_aws_rsync(self,
-                        source_path_list: List[Path],
-                        create_dirs: bool = False) -> None:
+    def batch_aws_rsync(
+        self, source_path_list: list[Path], create_dirs: bool = False
+    ) -> None:
         """Invokes aws s3 sync to batch upload a list of local paths to S3
 
         AWS Sync by default uses 10 threads to upload files to the bucket.  To
@@ -1265,34 +1316,42 @@ class S3Store(AbstractStore):
         """
 
         def get_file_sync_command(base_dir_path, file_names):
-            includes = ' '.join(
-                [f'--include "{file_name}"' for file_name in file_names])
-            sync_command = ('aws s3 sync --no-follow-symlinks --exclude="*" '
-                            f'{includes} {base_dir_path} '
-                            f's3://{self.name}')
+            includes = " ".join(
+                [f'--include "{file_name}"' for file_name in file_names]
+            )
+            sync_command = (
+                'aws s3 sync --no-follow-symlinks --exclude="*" '
+                f"{includes} {base_dir_path} "
+                f"s3://{self.name}"
+            )
             return sync_command
 
         def get_dir_sync_command(src_dir_path, dest_dir_name):
             # we exclude .git directory from the sync
             excluded_list = storage_utils.get_excluded_files_from_gitignore(
-                src_dir_path)
-            excluded_list.append('.git/*')
-            excludes = ' '.join(
-                [f'--exclude "{file_name}"' for file_name in excluded_list])
-            sync_command = (f'aws s3 sync --no-follow-symlinks {excludes} '
-                            f'{src_dir_path} '
-                            f's3://{self.name}/{dest_dir_name}')
+                src_dir_path
+            )
+            excluded_list.append(".git/*")
+            excludes = " ".join(
+                [f'--exclude "{file_name}"' for file_name in excluded_list]
+            )
+            sync_command = (
+                f"aws s3 sync --no-follow-symlinks {excludes} "
+                f"{src_dir_path} "
+                f"s3://{self.name}/{dest_dir_name}"
+            )
             return sync_command
 
         # Generate message for upload
         if len(source_path_list) > 1:
-            source_message = f'{len(source_path_list)} paths'
+            source_message = f"{len(source_path_list)} paths"
         else:
             source_message = source_path_list[0]
 
         with rich_utils.safe_status(
-                f'[bold cyan]Syncing '
-                f'[green]{source_message}[/] to [green]s3://{self.name}/[/]'):
+            f"[bold cyan]Syncing "
+            f"[green]{source_message}[/] to [green]s3://{self.name}/[/]"
+        ):
             data_utils.parallel_upload(
                 source_path_list,
                 get_file_sync_command,
@@ -1300,16 +1359,17 @@ class S3Store(AbstractStore):
                 self.name,
                 self._ACCESS_DENIED_MESSAGE,
                 create_dirs=create_dirs,
-                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS)
+                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS,
+            )
 
     def _transfer_to_s3(self) -> None:
         assert isinstance(self.source, str), self.source
-        if self.source.startswith('gs://'):
+        if self.source.startswith("gs://"):
             data_transfer.gcs_to_s3(self.name, self.name)
-        elif self.source.startswith('r2://'):
+        elif self.source.startswith("r2://"):
             data_transfer.r2_to_s3(self.name, self.name)
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Obtains the S3 bucket.
 
         If the bucket exists, this method will return the bucket.
@@ -1326,7 +1386,7 @@ class S3Store(AbstractStore):
                 attempted to be fetched while reconstructing the storage for
                 'sky storage delete' or 'sky start'
         """
-        s3 = aws.resource('s3')
+        s3 = aws.resource("s3")
         bucket = s3.Bucket(self.name)
 
         try:
@@ -1337,22 +1397,24 @@ class S3Store(AbstractStore):
             self.client.head_bucket(Bucket=self.name)
             return bucket, False
         except aws.botocore_exceptions().ClientError as e:
-            error_code = e.response['Error']['Code']
+            error_code = e.response["Error"]["Code"]
             # AccessDenied error for buckets that are private and not owned by
             # user.
-            if error_code == '403':
-                command = f'aws s3 ls {self.name}'
+            if error_code == "403":
+                command = f"aws s3 ls {self.name}"
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketGetError(
-                        _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name) +
-                        f' To debug, consider running `{command}`.') from e
+                        _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name)
+                        + f" To debug, consider running `{command}`."
+                    ) from e
 
-        if isinstance(self.source, str) and self.source.startswith('s3://'):
+        if isinstance(self.source, str) and self.source.startswith("s3://"):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketGetError(
-                    'Attempted to use a non-existent bucket as a source: '
-                    f'{self.source}. Consider using `aws s3 ls '
-                    f'{self.source}` to debug.')
+                    "Attempted to use a non-existent bucket as a source: "
+                    f"{self.source}. Consider using `aws s3 ls "
+                    f"{self.source}` to debug."
+                )
 
         # If bucket cannot be found in both private and public settings,
         # the bucket is to be created by Sky. However, creation is skipped if
@@ -1366,8 +1428,8 @@ class S3Store(AbstractStore):
             # delete or to re-mount Storages with sky start but the storage
             # is already removed externally.
             raise exceptions.StorageExternalDeletionError(
-                'Attempted to fetch a non-existent bucket: '
-                f'{self.name}')
+                f"Attempted to fetch a non-existent bucket: {self.name}"
+            )
 
     def _download_file(self, remote_path: str, local_path: str) -> None:
         """Downloads file from remote to local on s3 bucket
@@ -1387,21 +1449,23 @@ class S3Store(AbstractStore):
         Args:
           mount_path: str; Path to mount the bucket to.
         """
-        install_cmd = ('sudo wget -nc https://github.com/romilbhardwaj/goofys/'
-                       'releases/download/0.24.0-romilb-upstream/goofys '
-                       '-O /usr/local/bin/goofys && '
-                       'sudo chmod +x /usr/local/bin/goofys')
-        mount_cmd = ('goofys -o allow_other '
-                     f'--stat-cache-ttl {self._STAT_CACHE_TTL} '
-                     f'--type-cache-ttl {self._TYPE_CACHE_TTL} '
-                     f'{self.bucket.name} {mount_path}')
-        return mounting_utils.get_mounting_command(StorageMode.MOUNT,
-                                                   mount_path, mount_cmd,
-                                                   install_cmd)
+        install_cmd = (
+            "sudo wget -nc https://github.com/romilbhardwaj/goofys/"
+            "releases/download/0.24.0-romilb-upstream/goofys "
+            "-O /usr/local/bin/goofys && "
+            "sudo chmod +x /usr/local/bin/goofys"
+        )
+        mount_cmd = (
+            "goofys -o allow_other "
+            f"--stat-cache-ttl {self._STAT_CACHE_TTL} "
+            f"--type-cache-ttl {self._TYPE_CACHE_TTL} "
+            f"{self.bucket.name} {mount_path}"
+        )
+        return mounting_utils.get_mounting_command(
+            StorageMode.MOUNT, mount_path, mount_cmd, install_cmd
+        )
 
-    def _create_s3_bucket(self,
-                          bucket_name: str,
-                          region='us-east-2') -> StorageHandle:
+    def _create_s3_bucket(self, bucket_name: str, region="us-east-2") -> StorageHandle:
         """Creates S3 bucket with specific name in specific region
 
         Args:
@@ -1415,16 +1479,17 @@ class S3Store(AbstractStore):
             if region is None:
                 s3_client.create_bucket(Bucket=bucket_name)
             else:
-                location = {'LocationConstraint': region}
-                s3_client.create_bucket(Bucket=bucket_name,
-                                        CreateBucketConfiguration=location)
-                logger.info(f'Created S3 bucket {bucket_name} in {region}')
+                location = {"LocationConstraint": region}
+                s3_client.create_bucket(
+                    Bucket=bucket_name, CreateBucketConfiguration=location
+                )
+                logger.info(f"Created S3 bucket {bucket_name} in {region}")
         except aws.botocore_exceptions().ClientError as e:
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketCreateError(
-                    f'Attempted to create a bucket '
-                    f'{self.name} but failed.') from e
-        return aws.resource('s3').Bucket(bucket_name)
+                    f"Attempted to create a bucket {self.name} but failed."
+                ) from e
+        return aws.resource("s3").Bucket(bucket_name)
 
     def _delete_s3_bucket(self, bucket_name: str) -> bool:
         """Deletes S3 bucket, including all objects in bucket
@@ -1442,23 +1507,28 @@ class S3Store(AbstractStore):
         # https://stackoverflow.com/questions/49239351/why-is-it-so-much-slower-to-delete-objects-in-aws-s3-than-it-is-to-create-them
         # The fastest way to delete is to run `aws s3 rb --force`,
         # which removes the bucket by force.
-        remove_command = f'aws s3 rb s3://{bucket_name} --force'
+        remove_command = f"aws s3 rb s3://{bucket_name} --force"
         try:
             with rich_utils.safe_status(
-                    f'[bold cyan]Deleting S3 bucket {bucket_name}[/]'):
-                subprocess.check_output(remove_command.split(' '),
-                                        stderr=subprocess.STDOUT)
+                f"[bold cyan]Deleting S3 bucket {bucket_name}[/]"
+            ):
+                subprocess.check_output(
+                    remove_command.split(" "), stderr=subprocess.STDOUT
+                )
         except subprocess.CalledProcessError as e:
-            if 'NoSuchBucket' in e.output.decode('utf-8'):
+            if "NoSuchBucket" in e.output.decode("utf-8"):
                 logger.debug(
                     _BUCKET_EXTERNALLY_DELETED_DEBUG_MESSAGE.format(
-                        bucket_name=bucket_name))
+                        bucket_name=bucket_name
+                    )
+                )
                 return False
             else:
                 logger.error(e.output)
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketDeleteError(
-                        f'Failed to delete S3 bucket {bucket_name}.')
+                        f"Failed to delete S3 bucket {bucket_name}."
+                    )
 
         # Wait until bucket deletion propagates on AWS servers
         while data_utils.verify_s3_bucket(bucket_name):
@@ -1471,65 +1541,69 @@ class GcsStore(AbstractStore):
     for GCS buckets.
     """
 
-    _ACCESS_DENIED_MESSAGE = 'AccessDeniedException'
-    GCSFUSE_VERSION = '1.0.1'
+    _ACCESS_DENIED_MESSAGE = "AccessDeniedException"
+    GCSFUSE_VERSION = "1.0.1"
 
-    def __init__(self,
-                 name: str,
-                 source: str,
-                 region: Optional[str] = 'us-central1',
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: Optional[bool] = True):
-        self.client: 'storage.Client'
+    def __init__(
+        self,
+        name: str,
+        source: str,
+        region: str | None = "us-central1",
+        is_sky_managed: bool | None = None,
+        sync_on_reconstruction: bool | None = True,
+    ):
+        self.client: storage.Client
         self.bucket: StorageHandle
-        super().__init__(name, source, region, is_sky_managed,
-                         sync_on_reconstruction)
+        super().__init__(name, source, region, is_sky_managed, sync_on_reconstruction)
 
     def _validate(self):
         if self.source is not None:
             if isinstance(self.source, str):
-                if self.source.startswith('s3://'):
-                    assert self.name == data_utils.split_s3_path(
-                        self.source
-                    )[0], (
-                        'S3 Bucket is specified as path, the name should be the'
-                        ' same as S3 bucket.')
+                if self.source.startswith("s3://"):
+                    assert self.name == data_utils.split_s3_path(self.source)[0], (
+                        "S3 Bucket is specified as path, the name should be the"
+                        " same as S3 bucket."
+                    )
                     assert data_utils.verify_s3_bucket(self.name), (
-                        f'Source specified as {self.source}, an S3 bucket. ',
-                        'S3 Bucket should exist.')
-                elif self.source.startswith('gs://'):
-                    assert self.name == data_utils.split_gcs_path(
-                        self.source
-                    )[0], (
-                        'GCS Bucket is specified as path, the name should be '
-                        'the same as GCS bucket.')
-                elif self.source.startswith('r2://'):
-                    assert self.name == data_utils.split_r2_path(
-                        self.source
-                    )[0], ('R2 Bucket is specified as path, the name should be '
-                           'the same as R2 bucket.')
+                        f"Source specified as {self.source}, an S3 bucket. ",
+                        "S3 Bucket should exist.",
+                    )
+                elif self.source.startswith("gs://"):
+                    assert self.name == data_utils.split_gcs_path(self.source)[0], (
+                        "GCS Bucket is specified as path, the name should be "
+                        "the same as GCS bucket."
+                    )
+                elif self.source.startswith("r2://"):
+                    assert self.name == data_utils.split_r2_path(self.source)[0], (
+                        "R2 Bucket is specified as path, the name should be "
+                        "the same as R2 bucket."
+                    )
                     assert data_utils.verify_r2_bucket(self.name), (
-                        f'Source specified as {self.source}, a R2 bucket. ',
-                        'R2 Bucket should exist.')
-                elif self.source.startswith('cos://'):
-                    assert self.name == data_utils.split_cos_path(
-                        self.source
-                    )[0], (
-                        'COS Bucket is specified as path, the name should be '
-                        'the same as COS bucket.')
+                        f"Source specified as {self.source}, a R2 bucket. ",
+                        "R2 Bucket should exist.",
+                    )
+                elif self.source.startswith("cos://"):
+                    assert self.name == data_utils.split_cos_path(self.source)[0], (
+                        "COS Bucket is specified as path, the name should be "
+                        "the same as COS bucket."
+                    )
                     assert data_utils.verify_ibm_cos_bucket(self.name), (
-                        f'Source specified as {self.source}, a COS bucket. ',
-                        'COS Bucket should exist.')
+                        f"Source specified as {self.source}, a COS bucket. ",
+                        "COS Bucket should exist.",
+                    )
         # Validate name
         self.name = self.validate_name(self.name)
         # Check if the storage is enabled
         if not _is_storage_cloud_enabled(str(clouds.GCP())):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.ResourcesUnavailableError(
-                    'Storage \'store: gcs\' specified, but '
-                    'GCP access is disabled. To fix, enable '
-                    'GCP by running `sky check`. '
-                    'More info: https://skypilot.readthedocs.io/en/latest/getting-started/installation.html.')  # pylint: disable=line-too-long
+                    "Storage 'store: gcs' specified, but "
+                    "GCP access is disabled. To fix, enable "
+                    "GCP by running `sky check`. "
+                    "More info: "
+                    "https://skypilot.readthedocs.io/en/latest/"
+                    "getting-started/installation.html."
+                )
 
     @classmethod
     def validate_name(cls, name) -> str:
@@ -1546,47 +1620,52 @@ class GcsStore(AbstractStore):
             # Check for overall length
             if not 3 <= len(name) <= 222:
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must contain 3-222 '
-                    'characters.')
+                    f"Invalid store name: name {name} must contain 3-222 characters."
+                )
 
             # Check for valid characters and start/end with a number or letter
-            pattern = r'^[a-z0-9][-a-z0-9._]*[a-z0-9]$'
+            pattern = r"^[a-z0-9][-a-z0-9._]*[a-z0-9]$"
             if not re.match(pattern, name):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} can only contain '
-                    'lowercase letters, numeric characters, dashes (-), '
-                    'underscores (_), and dots (.). Spaces are not allowed. '
-                    'Names must start and end with a number or letter.')
+                    f"Invalid store name: name {name} can only contain "
+                    "lowercase letters, numeric characters, dashes (-), "
+                    "underscores (_), and dots (.). Spaces are not allowed. "
+                    "Names must start and end with a number or letter."
+                )
 
             # Check for 'goog' prefix and 'google' in the name
-            if name.startswith('goog') or any(
-                    s in name
-                    for s in ['google', 'g00gle', 'go0gle', 'g0ogle']):
+            if name.startswith("goog") or any(
+                s in name for s in ["google", "g00gle", "go0gle", "g0ogle"]
+            ):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} cannot begin with the '
-                    '"goog" prefix or contain "google" in various forms.')
+                    f"Invalid store name: name {name} cannot begin with the "
+                    '"goog" prefix or contain "google" in various forms.'
+                )
 
             # Check for dot-separated components length
-            components = name.split('.')
+            components = name.split(".")
             if any(len(component) > 63 for component in components):
                 _raise_no_traceback_name_error(
-                    'Invalid store name: Dot-separated components in name '
-                    f'{name} can be no longer than 63 characters.')
+                    "Invalid store name: Dot-separated components in name "
+                    f"{name} can be no longer than 63 characters."
+                )
 
-            if '..' in name or '.-' in name or '-.' in name:
+            if ".." in name or ".-" in name or "-." in name:
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} must not contain two '
-                    'adjacent periods or a dot next to a hyphen.')
+                    f"Invalid store name: name {name} must not contain two "
+                    "adjacent periods or a dot next to a hyphen."
+                )
 
             # Check for IP address format
-            ip_pattern = r'^(?:\d{1,3}\.){3}\d{1,3}$'
+            ip_pattern = r"^(?:\d{1,3}\.){3}\d{1,3}$"
             if re.match(ip_pattern, name):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: name {name} cannot be represented as '
-                    'an IP address in dotted-decimal notation '
-                    '(for example, 192.168.5.4).')
+                    f"Invalid store name: name {name} cannot be represented as "
+                    "an IP address in dotted-decimal notation "
+                    "(for example, 192.168.5.4)."
+                )
         else:
-            _raise_no_traceback_name_error('Store name must be specified.')
+            _raise_no_traceback_name_error("Store name must be specified.")
         return name
 
     def initialize(self):
@@ -1622,11 +1701,9 @@ class GcsStore(AbstractStore):
             if isinstance(self.source, list):
                 self.batch_gsutil_rsync(self.source, create_dirs=True)
             elif self.source is not None:
-                if self.source.startswith('gs://'):
+                if self.source.startswith("gs://"):
                     pass
-                elif self.source.startswith('s3://'):
-                    self._transfer_to_gcs()
-                elif self.source.startswith('r2://'):
+                elif self.source.startswith("s3://") or self.source.startswith("r2://"):
                     self._transfer_to_gcs()
                 else:
                     # If a single directory is specified in source, upload
@@ -1636,24 +1713,26 @@ class GcsStore(AbstractStore):
             raise
         except Exception as e:
             raise exceptions.StorageUploadError(
-                f'Upload failed for store {self.name}') from e
+                f"Upload failed for store {self.name}"
+            ) from e
 
     def delete(self) -> None:
         deleted_by_skypilot = self._delete_gcs_bucket(self.name)
         if deleted_by_skypilot:
-            msg_str = f'Deleted GCS bucket {self.name}.'
+            msg_str = f"Deleted GCS bucket {self.name}."
         else:
-            msg_str = f'GCS bucket {self.name} may have been deleted ' \
-                      f'externally. Removing from local state.'
-        logger.info(f'{colorama.Fore.GREEN}{msg_str}'
-                    f'{colorama.Style.RESET_ALL}')
+            msg_str = (
+                f"GCS bucket {self.name} may have been deleted "
+                f"externally. Removing from local state."
+            )
+        logger.info(f"{colorama.Fore.GREEN}{msg_str}{colorama.Style.RESET_ALL}")
 
     def get_handle(self) -> StorageHandle:
         return self.client.get_bucket(self.name)
 
-    def batch_gsutil_cp(self,
-                        source_path_list: List[Path],
-                        create_dirs: bool = False) -> None:
+    def batch_gsutil_cp(
+        self, source_path_list: list[Path], create_dirs: bool = False
+    ) -> None:
         """Invokes gsutil cp -n to batch upload a list of local paths
 
         -n flag to gsutil cp checks the existence of an object before uploading,
@@ -1664,7 +1743,7 @@ class GcsStore(AbstractStore):
         """
         # Generate message for upload
         if len(source_path_list) > 1:
-            source_message = f'{len(source_path_list)} paths'
+            source_message = f"{len(source_path_list)} paths"
         else:
             source_message = source_path_list[0]
 
@@ -1673,26 +1752,29 @@ class GcsStore(AbstractStore):
         # contents of directory to the root, add /* to the directory path
         # e.g., /mydir/*
         source_path_list = [
-            str(path) + '/*' if
-            (os.path.isdir(path) and not create_dirs) else str(path)
+            str(path) + "/*" if (os.path.isdir(path) and not create_dirs) else str(path)
             for path in source_path_list
         ]
-        copy_list = '\n'.join(
-            os.path.abspath(os.path.expanduser(p)) for p in source_path_list)
+        copy_list = "\n".join(
+            os.path.abspath(os.path.expanduser(p)) for p in source_path_list
+        )
         gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-        sync_command = (f'{alias_gen}; echo "{copy_list}" | {gsutil_alias} '
-                        f'cp -e -n -r -I gs://{self.name}')
+        sync_command = (
+            f'{alias_gen}; echo "{copy_list}" | {gsutil_alias} '
+            f"cp -e -n -r -I gs://{self.name}"
+        )
 
         with rich_utils.safe_status(
-                f'[bold cyan]Syncing '
-                f'[green]{source_message}[/] to [green]gs://{self.name}/[/]'):
-            data_utils.run_upload_cli(sync_command,
-                                      self._ACCESS_DENIED_MESSAGE,
-                                      bucket_name=self.name)
+            f"[bold cyan]Syncing [green]{source_message}[/] to "
+            f"[green]gs://{self.name}/[/]"
+        ):
+            data_utils.run_upload_cli(
+                sync_command, self._ACCESS_DENIED_MESSAGE, bucket_name=self.name
+            )
 
-    def batch_gsutil_rsync(self,
-                           source_path_list: List[Path],
-                           create_dirs: bool = False) -> None:
+    def batch_gsutil_rsync(
+        self, source_path_list: list[Path], create_dirs: bool = False
+    ) -> None:
         """Invokes gsutil rsync to batch upload a list of local paths
 
         Since gsutil rsync does not support include commands, We use negative
@@ -1712,34 +1794,40 @@ class GcsStore(AbstractStore):
         """
 
         def get_file_sync_command(base_dir_path, file_names):
-            sync_format = '|'.join(file_names)
+            sync_format = "|".join(file_names)
             gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-            sync_command = (f'{alias_gen}; {gsutil_alias} '
-                            f'rsync -e -x \'^(?!{sync_format}$).*\' '
-                            f'{base_dir_path} gs://{self.name}')
+            sync_command = (
+                f"{alias_gen}; {gsutil_alias} "
+                f"rsync -e -x '^(?!{sync_format}$).*' "
+                f"{base_dir_path} gs://{self.name}"
+            )
             return sync_command
 
         def get_dir_sync_command(src_dir_path, dest_dir_name):
             excluded_list = storage_utils.get_excluded_files_from_gitignore(
-                src_dir_path)
+                src_dir_path
+            )
             # we exclude .git directory from the sync
-            excluded_list.append(r'^\.git/.*$')
-            excludes = '|'.join(excluded_list)
+            excluded_list.append(r"^\.git/.*$")
+            excludes = "|".join(excluded_list)
             gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-            sync_command = (f'{alias_gen}; {gsutil_alias} '
-                            f'rsync -e -r -x \'({excludes})\' {src_dir_path} '
-                            f'gs://{self.name}/{dest_dir_name}')
+            sync_command = (
+                f"{alias_gen}; {gsutil_alias} "
+                f"rsync -e -r -x '({excludes})' {src_dir_path} "
+                f"gs://{self.name}/{dest_dir_name}"
+            )
             return sync_command
 
         # Generate message for upload
         if len(source_path_list) > 1:
-            source_message = f'{len(source_path_list)} paths'
+            source_message = f"{len(source_path_list)} paths"
         else:
             source_message = source_path_list[0]
 
         with rich_utils.safe_status(
-                f'[bold cyan]Syncing '
-                f'[green]{source_message}[/] to [green]gs://{self.name}/[/]'):
+            f"[bold cyan]Syncing "
+            f"[green]{source_message}[/] to [green]gs://{self.name}/[/]"
+        ):
             data_utils.parallel_upload(
                 source_path_list,
                 get_file_sync_command,
@@ -1747,15 +1835,16 @@ class GcsStore(AbstractStore):
                 self.name,
                 self._ACCESS_DENIED_MESSAGE,
                 create_dirs=create_dirs,
-                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS)
+                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS,
+            )
 
     def _transfer_to_gcs(self) -> None:
-        if isinstance(self.source, str) and self.source.startswith('s3://'):
+        if isinstance(self.source, str) and self.source.startswith("s3://"):
             data_transfer.s3_to_gcs(self.name, self.name)
-        elif isinstance(self.source, str) and self.source.startswith('r2://'):
+        elif isinstance(self.source, str) and self.source.startswith("r2://"):
             data_transfer.r2_to_gcs(self.name, self.name)
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Obtains the GCS bucket.
         If the bucket exists, this method will connect to the bucket.
 
@@ -1776,11 +1865,12 @@ class GcsStore(AbstractStore):
             bucket = self.client.get_bucket(self.name)
             return bucket, False
         except gcp.not_found_exception() as e:
-            if isinstance(self.source, str) and self.source.startswith('gs://'):
+            if isinstance(self.source, str) and self.source.startswith("gs://"):
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketGetError(
-                        'Attempted to use a non-existent bucket as a source: '
-                        f'{self.source}') from e
+                        "Attempted to use a non-existent bucket as a source: "
+                        f"{self.source}"
+                    ) from e
             else:
                 # If bucket cannot be found (i.e., does not exist), it is to be
                 # created by Sky. However, creation is skipped if Store object
@@ -1794,12 +1884,11 @@ class GcsStore(AbstractStore):
                     # sky storage delete or to re-mount Storages with sky start
                     # but the storage is already removed externally.
                     raise exceptions.StorageExternalDeletionError(
-                        'Attempted to fetch a non-existent bucket: '
-                        f'{self.name}') from e
+                        f"Attempted to fetch a non-existent bucket: {self.name}"
+                    ) from e
         except gcp.forbidden_exception():
             # Try public bucket to see if bucket exists
-            logger.info(
-                'External Bucket detected; Connecting to external bucket...')
+            logger.info("External Bucket detected; Connecting to external bucket...")
             try:
                 a_client = gcp.anonymous_storage_client()
                 bucket = a_client.bucket(self.name)
@@ -1807,11 +1896,12 @@ class GcsStore(AbstractStore):
                 next(bucket.list_blobs())
                 return bucket, False
             except (gcp.not_found_exception(), ValueError) as e:
-                command = f'gsutil ls gs://{self.name}'
+                command = f"gsutil ls gs://{self.name}"
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketGetError(
-                        _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name) +
-                        f' To debug, consider running `{command}`.') from e
+                        _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name)
+                        + f" To debug, consider running `{command}`."
+                    ) from e
 
     def mount_command(self, mount_path: str) -> str:
         """Returns the command to mount the bucket to the mount_path.
@@ -1821,24 +1911,26 @@ class GcsStore(AbstractStore):
         Args:
           mount_path: str; Path to mount the bucket to.
         """
-        install_cmd = ('wget -nc https://github.com/GoogleCloudPlatform/gcsfuse'
-                       f'/releases/download/v{self.GCSFUSE_VERSION}/'
-                       f'gcsfuse_{self.GCSFUSE_VERSION}_amd64.deb '
-                       '-O /tmp/gcsfuse.deb && '
-                       'sudo dpkg --install /tmp/gcsfuse.deb')
-        mount_cmd = ('gcsfuse -o allow_other '
-                     '--implicit-dirs '
-                     f'--stat-cache-capacity {self._STAT_CACHE_CAPACITY} '
-                     f'--stat-cache-ttl {self._STAT_CACHE_TTL} '
-                     f'--type-cache-ttl {self._TYPE_CACHE_TTL} '
-                     f'--rename-dir-limit {self._RENAME_DIR_LIMIT} '
-                     f'{self.bucket.name} {mount_path}')
-        version_check_cmd = (
-            f'gcsfuse --version | grep -q {self.GCSFUSE_VERSION}')
-        return mounting_utils.get_mounting_command(StorageMode.MOUNT,
-                                                   mount_path, mount_cmd,
-                                                   install_cmd,
-                                                   version_check_cmd)
+        install_cmd = (
+            "wget -nc https://github.com/GoogleCloudPlatform/gcsfuse"
+            f"/releases/download/v{self.GCSFUSE_VERSION}/"
+            f"gcsfuse_{self.GCSFUSE_VERSION}_amd64.deb "
+            "-O /tmp/gcsfuse.deb && "
+            "sudo dpkg --install /tmp/gcsfuse.deb"
+        )
+        mount_cmd = (
+            "gcsfuse -o allow_other "
+            "--implicit-dirs "
+            f"--stat-cache-capacity {self._STAT_CACHE_CAPACITY} "
+            f"--stat-cache-ttl {self._STAT_CACHE_TTL} "
+            f"--type-cache-ttl {self._TYPE_CACHE_TTL} "
+            f"--rename-dir-limit {self._RENAME_DIR_LIMIT} "
+            f"{self.bucket.name} {mount_path}"
+        )
+        version_check_cmd = f"gcsfuse --version | grep -q {self.GCSFUSE_VERSION}"
+        return mounting_utils.get_mounting_command(
+            StorageMode.MOUNT, mount_path, mount_cmd, install_cmd, version_check_cmd
+        )
 
     def _download_file(self, remote_path: str, local_path: str) -> None:
         """Downloads file from remote to local on GS bucket
@@ -1850,9 +1942,9 @@ class GcsStore(AbstractStore):
         blob = self.bucket.blob(remote_path)
         blob.download_to_filename(local_path, timeout=None)
 
-    def _create_gcs_bucket(self,
-                           bucket_name: str,
-                           region='us-central1') -> StorageHandle:
+    def _create_gcs_bucket(
+        self, bucket_name: str, region="us-central1"
+    ) -> StorageHandle:
         """Creates GCS bucket with specific name in specific region
 
         Args:
@@ -1861,16 +1953,17 @@ class GcsStore(AbstractStore):
         """
         try:
             bucket = self.client.bucket(bucket_name)
-            bucket.storage_class = 'STANDARD'
+            bucket.storage_class = "STANDARD"
             new_bucket = self.client.create_bucket(bucket, location=region)
         except Exception as e:  # pylint: disable=broad-except
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketCreateError(
-                    f'Attempted to create a bucket {self.name} but failed.'
+                    f"Attempted to create a bucket {self.name} but failed."
                 ) from e
         logger.info(
-            f'Created GCS bucket {new_bucket.name} in {new_bucket.location} '
-            f'with storage class {new_bucket.storage_class}')
+            f"Created GCS bucket {new_bucket.name} in {new_bucket.location} "
+            f"with storage class {new_bucket.storage_class}"
+        )
         return new_bucket
 
     def _delete_gcs_bucket(self, bucket_name: str) -> bool:
@@ -1883,37 +1976,43 @@ class GcsStore(AbstractStore):
          bool; True if bucket was deleted, False if it was deleted externally.
         """
 
-        with rich_utils.safe_status(
-                f'[bold cyan]Deleting GCS bucket {bucket_name}[/]'):
+        with rich_utils.safe_status(f"[bold cyan]Deleting GCS bucket {bucket_name}[/]"):
             try:
                 self.client.get_bucket(bucket_name)
             except gcp.forbidden_exception() as e:
                 # Try public bucket to see if bucket exists
                 with ux_utils.print_exception_no_traceback():
                     raise PermissionError(
-                        'External Bucket detected. User not allowed to delete '
-                        'external bucket.') from e
+                        "External Bucket detected. User not allowed to delete "
+                        "external bucket."
+                    ) from e
             except gcp.not_found_exception():
                 # If bucket does not exist, it may have been deleted externally.
                 # Do a no-op in that case.
                 logger.debug(
                     _BUCKET_EXTERNALLY_DELETED_DEBUG_MESSAGE.format(
-                        bucket_name=bucket_name))
+                        bucket_name=bucket_name
+                    )
+                )
                 return False
             try:
                 gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-                remove_obj_command = (f'{alias_gen};{gsutil_alias} '
-                                      f'rm -r gs://{bucket_name}')
-                subprocess.check_output(remove_obj_command,
-                                        stderr=subprocess.STDOUT,
-                                        shell=True,
-                                        executable='/bin/bash')
+                remove_obj_command = (
+                    f"{alias_gen};{gsutil_alias} rm -r gs://{bucket_name}"
+                )
+                subprocess.check_output(
+                    remove_obj_command,
+                    stderr=subprocess.STDOUT,
+                    shell=True,
+                    executable="/bin/bash",
+                )
                 return True
             except subprocess.CalledProcessError as e:
                 logger.error(e.output)
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketDeleteError(
-                        f'Failed to delete GCS bucket {bucket_name}.')
+                        f"Failed to delete GCS bucket {bucket_name}."
+                    )
 
 
 class R2Store(AbstractStore):
@@ -1921,57 +2020,65 @@ class R2Store(AbstractStore):
     for R2 buckets.
     """
 
-    _ACCESS_DENIED_MESSAGE = 'Access Denied'
+    _ACCESS_DENIED_MESSAGE = "Access Denied"
 
-    def __init__(self,
-                 name: str,
-                 source: str,
-                 region: Optional[str] = 'auto',
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: Optional[bool] = True):
-        self.client: 'boto3.client.Client'
-        self.bucket: 'StorageHandle'
-        super().__init__(name, source, region, is_sky_managed,
-                         sync_on_reconstruction)
+    def __init__(
+        self,
+        name: str,
+        source: str,
+        region: str | None = "auto",
+        is_sky_managed: bool | None = None,
+        sync_on_reconstruction: bool | None = True,
+    ):
+        self.client: boto3.client.Client
+        self.bucket: StorageHandle
+        super().__init__(name, source, region, is_sky_managed, sync_on_reconstruction)
 
     def _validate(self):
         if self.source is not None and isinstance(self.source, str):
-            if self.source.startswith('s3://'):
+            if self.source.startswith("s3://"):
                 assert self.name == data_utils.split_s3_path(self.source)[0], (
-                    'S3 Bucket is specified as path, the name should be the'
-                    ' same as S3 bucket.')
+                    "S3 Bucket is specified as path, the name should be the"
+                    " same as S3 bucket."
+                )
                 assert data_utils.verify_s3_bucket(self.name), (
-                    f'Source specified as {self.source}, a S3 bucket. ',
-                    'S3 Bucket should exist.')
-            elif self.source.startswith('gs://'):
+                    f"Source specified as {self.source}, a S3 bucket. ",
+                    "S3 Bucket should exist.",
+                )
+            elif self.source.startswith("gs://"):
                 assert self.name == data_utils.split_gcs_path(self.source)[0], (
-                    'GCS Bucket is specified as path, the name should be '
-                    'the same as GCS bucket.')
+                    "GCS Bucket is specified as path, the name should be "
+                    "the same as GCS bucket."
+                )
                 assert data_utils.verify_gcs_bucket(self.name), (
-                    f'Source specified as {self.source}, a GCS bucket. ',
-                    'GCS Bucket should exist.')
-            elif self.source.startswith('r2://'):
+                    f"Source specified as {self.source}, a GCS bucket. ",
+                    "GCS Bucket should exist.",
+                )
+            elif self.source.startswith("r2://"):
                 assert self.name == data_utils.split_r2_path(self.source)[0], (
-                    'R2 Bucket is specified as path, the name should be '
-                    'the same as R2 bucket.')
-            elif self.source.startswith('cos://'):
+                    "R2 Bucket is specified as path, the name should be "
+                    "the same as R2 bucket."
+                )
+            elif self.source.startswith("cos://"):
                 assert self.name == data_utils.split_cos_path(self.source)[0], (
-                    'IBM COS Bucket is specified as path, the name should be '
-                    'the same as COS bucket.')
+                    "IBM COS Bucket is specified as path, the name should be "
+                    "the same as COS bucket."
+                )
                 assert data_utils.verify_ibm_cos_bucket(self.name), (
-                    f'Source specified as {self.source}, a COS bucket. ',
-                    'COS Bucket should exist.')
+                    f"Source specified as {self.source}, a COS bucket. ",
+                    "COS Bucket should exist.",
+                )
         # Validate name
         self.name = S3Store.validate_name(self.name)
         # Check if the storage is enabled
         if not _is_storage_cloud_enabled(cloudflare.NAME):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.ResourcesUnavailableError(
-                    'Storage \'store: r2\' specified, but ' \
-                    'Cloudflare R2 access is disabled. To fix, '\
-                    'enable Cloudflare R2 by running `sky check`. '\
-                    'More info: https://skypilot.readthedocs.io/en/latest/getting-started/installation.html.'  # pylint: disable=line-too-long
-                    )
+                    "Storage 'store: r2' specified, but "
+                    "Cloudflare R2 access is disabled. To fix, "
+                    "enable Cloudflare R2 by running `sky check`. "
+                    "More info: https://skypilot.readthedocs.io/en/latest/getting-started/installation.html."  # pylint: disable=line-too-long
+                )
 
     def initialize(self):
         """Initializes the R2 store object on the cloud.
@@ -2006,11 +2113,9 @@ class R2Store(AbstractStore):
             if isinstance(self.source, list):
                 self.batch_aws_rsync(self.source, create_dirs=True)
             elif self.source is not None:
-                if self.source.startswith('s3://'):
+                if self.source.startswith("s3://") or self.source.startswith("gs://"):
                     self._transfer_to_r2()
-                elif self.source.startswith('gs://'):
-                    self._transfer_to_r2()
-                elif self.source.startswith('r2://'):
+                elif self.source.startswith("r2://"):
                     pass
                 else:
                     self.batch_aws_rsync([self.source])
@@ -2018,27 +2123,29 @@ class R2Store(AbstractStore):
             raise
         except Exception as e:
             raise exceptions.StorageUploadError(
-                f'Upload failed for store {self.name}') from e
+                f"Upload failed for store {self.name}"
+            ) from e
 
     def delete(self) -> None:
         deleted_by_skypilot = self._delete_r2_bucket(self.name)
         if deleted_by_skypilot:
-            msg_str = f'Deleted R2 bucket {self.name}.'
+            msg_str = f"Deleted R2 bucket {self.name}."
         else:
-            msg_str = f'R2 bucket {self.name} may have been deleted ' \
-                      f'externally. Removing from local state.'
-        logger.info(f'{colorama.Fore.GREEN}{msg_str}'
-                    f'{colorama.Style.RESET_ALL}')
+            msg_str = (
+                f"R2 bucket {self.name} may have been deleted "
+                f"externally. Removing from local state."
+            )
+        logger.info(f"{colorama.Fore.GREEN}{msg_str}{colorama.Style.RESET_ALL}")
 
     def get_handle(self) -> StorageHandle:
-        return cloudflare.resource('s3').Bucket(self.name)
+        return cloudflare.resource("s3").Bucket(self.name)
 
-    def batch_aws_rsync(self,
-                        source_path_list: List[Path],
-                        create_dirs: bool = False) -> None:
-        """Invokes aws s3 sync to batch upload a list of local paths to R2
+    def batch_aws_rsync(
+        self, source_path_list: list[Path], create_dirs: bool = False
+    ) -> None:
+        """Invokes aws s3 sync to batch upload a list of local paths to R2.
 
-        AWS Sync by default uses 10 threads to upload files to the bucket.  To
+        AWS Sync by default uses 10 threads to upload files to the bucket. To
         increase parallelism, modify max_concurrent_requests in your aws config
         file (Default path: ~/.aws/config).
 
@@ -2055,45 +2162,53 @@ class R2Store(AbstractStore):
         """
 
         def get_file_sync_command(base_dir_path, file_names):
-            includes = ' '.join(
-                [f'--include "{file_name}"' for file_name in file_names])
+            includes = " ".join(
+                [f'--include "{file_name}"' for file_name in file_names]
+            )
             endpoint_url = cloudflare.create_endpoint()
-            sync_command = ('AWS_SHARED_CREDENTIALS_FILE='
-                            f'{cloudflare.R2_CREDENTIALS_PATH} '
-                            'aws s3 sync --no-follow-symlinks --exclude="*" '
-                            f'{includes} {base_dir_path} '
-                            f's3://{self.name} '
-                            f'--endpoint {endpoint_url} '
-                            f'--profile={cloudflare.R2_PROFILE_NAME}')
+            sync_command = (
+                "AWS_SHARED_CREDENTIALS_FILE="
+                f"{cloudflare.R2_CREDENTIALS_PATH} "
+                'aws s3 sync --no-follow-symlinks --exclude="*" '
+                f"{includes} {base_dir_path} "
+                f"s3://{self.name} "
+                f"--endpoint {endpoint_url} "
+                f"--profile={cloudflare.R2_PROFILE_NAME}"
+            )
             return sync_command
 
         def get_dir_sync_command(src_dir_path, dest_dir_name):
             # we exclude .git directory from the sync
             excluded_list = storage_utils.get_excluded_files_from_gitignore(
-                src_dir_path)
-            excluded_list.append('.git/*')
-            excludes = ' '.join(
-                [f'--exclude "{file_name}"' for file_name in excluded_list])
+                src_dir_path
+            )
+            excluded_list.append(".git/*")
+            excludes = " ".join(
+                [f'--exclude "{file_name}"' for file_name in excluded_list]
+            )
             endpoint_url = cloudflare.create_endpoint()
 
-            sync_command = ('AWS_SHARED_CREDENTIALS_FILE='
-                            f'{cloudflare.R2_CREDENTIALS_PATH} '
-                            f'aws s3 sync --no-follow-symlinks {excludes} '
-                            f'{src_dir_path} '
-                            f's3://{self.name}/{dest_dir_name} '
-                            f'--endpoint {endpoint_url} '
-                            f'--profile={cloudflare.R2_PROFILE_NAME}')
+            sync_command = (
+                "AWS_SHARED_CREDENTIALS_FILE="
+                f"{cloudflare.R2_CREDENTIALS_PATH} "
+                f"aws s3 sync --no-follow-symlinks {excludes} "
+                f"{src_dir_path} "
+                f"s3://{self.name}/{dest_dir_name} "
+                f"--endpoint {endpoint_url} "
+                f"--profile={cloudflare.R2_PROFILE_NAME}"
+            )
             return sync_command
 
         # Generate message for upload
         if len(source_path_list) > 1:
-            source_message = f'{len(source_path_list)} paths'
+            source_message = f"{len(source_path_list)} paths"
         else:
             source_message = source_path_list[0]
 
         with rich_utils.safe_status(
-                f'[bold cyan]Syncing '
-                f'[green]{source_message}[/] to [green]r2://{self.name}/[/]'):
+            f"[bold cyan]Syncing "
+            f"[green]{source_message}[/] to [green]r2://{self.name}/[/]"
+        ):
             data_utils.parallel_upload(
                 source_path_list,
                 get_file_sync_command,
@@ -2101,16 +2216,17 @@ class R2Store(AbstractStore):
                 self.name,
                 self._ACCESS_DENIED_MESSAGE,
                 create_dirs=create_dirs,
-                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS)
+                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS,
+            )
 
     def _transfer_to_r2(self) -> None:
         assert isinstance(self.source, str), self.source
-        if self.source.startswith('gs://'):
+        if self.source.startswith("gs://"):
             data_transfer.gcs_to_r2(self.name, self.name)
-        elif self.source.startswith('s3://'):
+        elif self.source.startswith("s3://"):
             data_transfer.s3_to_r2(self.name, self.name)
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Obtains the R2 bucket.
 
         If the bucket exists, this method will return the bucket.
@@ -2127,7 +2243,7 @@ class R2Store(AbstractStore):
                 attempted to be fetched while reconstructing the storage for
                 'sky storage delete' or 'sky start'
         """
-        r2 = cloudflare.resource('s3')
+        r2 = cloudflare.resource("s3")
         bucket = r2.Bucket(self.name)
         endpoint_url = cloudflare.create_endpoint()
         try:
@@ -2138,31 +2254,35 @@ class R2Store(AbstractStore):
             self.client.head_bucket(Bucket=self.name)
             return bucket, False
         except aws.botocore_exceptions().ClientError as e:
-            error_code = e.response['Error']['Code']
+            error_code = e.response["Error"]["Code"]
             # AccessDenied error for buckets that are private and not owned by
             # user.
-            if error_code == '403':
-                command = ('AWS_SHARED_CREDENTIALS_FILE='
-                           f'{cloudflare.R2_CREDENTIALS_PATH} '
-                           f'aws s3 ls s3://{self.name} '
-                           f'--endpoint {endpoint_url} '
-                           f'--profile={cloudflare.R2_PROFILE_NAME}')
+            if error_code == "403":
+                command = (
+                    "AWS_SHARED_CREDENTIALS_FILE="
+                    f"{cloudflare.R2_CREDENTIALS_PATH} "
+                    f"aws s3 ls s3://{self.name} "
+                    f"--endpoint {endpoint_url} "
+                    f"--profile={cloudflare.R2_PROFILE_NAME}"
+                )
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketGetError(
-                        _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name) +
-                        f' To debug, consider running `{command}`.') from e
+                        _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name)
+                        + f" To debug, consider running `{command}`."
+                    ) from e
 
-        if isinstance(self.source, str) and self.source.startswith('r2://'):
+        if isinstance(self.source, str) and self.source.startswith("r2://"):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketGetError(
-                    'Attempted to use a non-existent bucket as a source: '
-                    f'{self.source}. Consider using '
-                    '`AWS_SHARED_CREDENTIALS_FILE='
-                    f'{cloudflare.R2_CREDENTIALS_PATH} aws s3 ls '
-                    f's3://{self.name} '
-                    f'--endpoint {endpoint_url} '
-                    f'--profile={cloudflare.R2_PROFILE_NAME}\' '
-                    'to debug.')
+                    "Attempted to use a non-existent bucket as a source: "
+                    f"{self.source}. Consider using "
+                    "`AWS_SHARED_CREDENTIALS_FILE="
+                    f"{cloudflare.R2_CREDENTIALS_PATH} aws s3 ls "
+                    f"s3://{self.name} "
+                    f"--endpoint {endpoint_url} "
+                    f"--profile={cloudflare.R2_PROFILE_NAME}' "
+                    "to debug."
+                )
 
         # If bucket cannot be found in both private and public settings,
         # the bucket is to be created by Sky. However, creation is skipped if
@@ -2176,16 +2296,15 @@ class R2Store(AbstractStore):
             # delete or to re-mount Storages with sky start but the storage
             # is already removed externally.
             raise exceptions.StorageExternalDeletionError(
-                'Attempted to fetch a non-existent bucket: '
-                f'{self.name}')
+                f"Attempted to fetch a non-existent bucket: {self.name}"
+            )
 
     def _download_file(self, remote_path: str, local_path: str) -> None:
-        """Downloads file from remote to local on r2 bucket
-        using the boto3 API
+        """Downloads file from remote to local on r2 bucket using the boto3 API.
 
         Args:
-          remote_path: str; Remote path on R2 bucket
-          local_path: str; Local path on user's device
+            remote_path: str; Remote path on R2 bucket
+            local_path: str; Local path on user's device
         """
         self.bucket.download_file(remote_path, local_path)
 
@@ -2197,25 +2316,28 @@ class R2Store(AbstractStore):
         Args:
           mount_path: str; Path to mount the bucket to.
         """
-        install_cmd = ('sudo wget -nc https://github.com/romilbhardwaj/goofys/'
-                       'releases/download/0.24.0-romilb-upstream/goofys '
-                       '-O /usr/local/bin/goofys && '
-                       'sudo chmod +x /usr/local/bin/goofys')
+        install_cmd = (
+            "sudo wget -nc https://github.com/romilbhardwaj/goofys/"
+            "releases/download/0.24.0-romilb-upstream/goofys "
+            "-O /usr/local/bin/goofys && "
+            "sudo chmod +x /usr/local/bin/goofys"
+        )
         endpoint_url = cloudflare.create_endpoint()
         mount_cmd = (
-            f'AWS_SHARED_CREDENTIALS_FILE={cloudflare.R2_CREDENTIALS_PATH} '
-            f'AWS_PROFILE={cloudflare.R2_PROFILE_NAME} goofys -o allow_other '
-            f'--stat-cache-ttl {self._STAT_CACHE_TTL} '
-            f'--type-cache-ttl {self._TYPE_CACHE_TTL} '
-            f'--endpoint {endpoint_url} '
-            f'{self.bucket.name} {mount_path}')
-        return mounting_utils.get_mounting_command(StorageMode.MOUNT,
-                                                   mount_path, mount_cmd,
-                                                   install_cmd)
+            f"AWS_SHARED_CREDENTIALS_FILE={cloudflare.R2_CREDENTIALS_PATH} "
+            f"AWS_PROFILE={cloudflare.R2_PROFILE_NAME} goofys -o allow_other "
+            f"--stat-cache-ttl {self._STAT_CACHE_TTL} "
+            f"--type-cache-ttl {self._TYPE_CACHE_TTL} "
+            f"--endpoint {endpoint_url} "
+            f"{self.bucket.name} {mount_path}"
+        )
+        return mounting_utils.get_mounting_command(
+            StorageMode.MOUNT, mount_path, mount_cmd, install_cmd
+        )
 
-    def csync_command(self,
-                      csync_path: str,
-                      interval_seconds: Optional[int] = None) -> str:
+    def csync_command(
+        self, csync_path: str, interval_seconds: int | None = None
+    ) -> str:
         """Returns command to mount CSYNC with Storage bucket on CSYNC_PATH.
 
         Args:
@@ -2224,9 +2346,7 @@ class R2Store(AbstractStore):
         """
         raise NotImplementedError
 
-    def _create_r2_bucket(self,
-                          bucket_name: str,
-                          region='auto') -> StorageHandle:
+    def _create_r2_bucket(self, bucket_name: str, region="auto") -> StorageHandle:
         """Creates R2 bucket with specific name in specific region
 
         Args:
@@ -2240,16 +2360,17 @@ class R2Store(AbstractStore):
             if region is None:
                 r2_client.create_bucket(Bucket=bucket_name)
             else:
-                location = {'LocationConstraint': region}
-                r2_client.create_bucket(Bucket=bucket_name,
-                                        CreateBucketConfiguration=location)
-                logger.info(f'Created R2 bucket {bucket_name} in {region}')
+                location = {"LocationConstraint": region}
+                r2_client.create_bucket(
+                    Bucket=bucket_name, CreateBucketConfiguration=location
+                )
+                logger.info(f"Created R2 bucket {bucket_name} in {region}")
         except aws.botocore_exceptions().ClientError as e:
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketCreateError(
-                    f'Attempted to create a bucket '
-                    f'{self.name} but failed.') from e
-        return cloudflare.resource('s3').Bucket(bucket_name)
+                    f"Attempted to create a bucket {self.name} but failed."
+                ) from e
+        return cloudflare.resource("s3").Bucket(bucket_name)
 
     def _delete_r2_bucket(self, bucket_name: str) -> bool:
         """Deletes R2 bucket, including all objects in bucket
@@ -2269,27 +2390,32 @@ class R2Store(AbstractStore):
         # which removes the bucket by force.
         endpoint_url = cloudflare.create_endpoint()
         remove_command = (
-            f'AWS_SHARED_CREDENTIALS_FILE={cloudflare.R2_CREDENTIALS_PATH} '
-            f'aws s3 rb s3://{bucket_name} --force '
-            f'--endpoint {endpoint_url} '
-            f'--profile={cloudflare.R2_PROFILE_NAME}')
+            f"AWS_SHARED_CREDENTIALS_FILE={cloudflare.R2_CREDENTIALS_PATH} "
+            f"aws s3 rb s3://{bucket_name} --force "
+            f"--endpoint {endpoint_url} "
+            f"--profile={cloudflare.R2_PROFILE_NAME}"
+        )
         try:
             with rich_utils.safe_status(
-                    f'[bold cyan]Deleting R2 bucket {bucket_name}[/]'):
-                subprocess.check_output(remove_command,
-                                        stderr=subprocess.STDOUT,
-                                        shell=True)
+                f"[bold cyan]Deleting R2 bucket {bucket_name}[/]"
+            ):
+                subprocess.check_output(
+                    remove_command, stderr=subprocess.STDOUT, shell=True
+                )
         except subprocess.CalledProcessError as e:
-            if 'NoSuchBucket' in e.output.decode('utf-8'):
+            if "NoSuchBucket" in e.output.decode("utf-8"):
                 logger.debug(
                     _BUCKET_EXTERNALLY_DELETED_DEBUG_MESSAGE.format(
-                        bucket_name=bucket_name))
+                        bucket_name=bucket_name
+                    )
+                )
                 return False
             else:
                 logger.error(e.output)
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageBucketDeleteError(
-                        f'Failed to delete R2 bucket {bucket_name}.')
+                        f"Failed to delete R2 bucket {bucket_name}."
+                    )
 
         # Wait until bucket deletion propagates on AWS servers
         while data_utils.verify_r2_bucket(bucket_name):
@@ -2301,49 +2427,58 @@ class IBMCosStore(AbstractStore):
     """IBMCosStore inherits from Storage Object and represents the backend
     for COS buckets.
     """
-    _ACCESS_DENIED_MESSAGE = 'Access Denied'
 
-    def __init__(self,
-                 name: str,
-                 source: str,
-                 region: Optional[str] = 'us-east',
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: bool = True):
-        self.client: 'storage.Client'
-        self.bucket: 'StorageHandle'
-        super().__init__(name, source, region, is_sky_managed,
-                         sync_on_reconstruction)
-        self.bucket_rclone_profile = \
-          Rclone.generate_rclone_bucket_profile_name(
-            self.name, Rclone.RcloneClouds.IBM)
+    _ACCESS_DENIED_MESSAGE = "Access Denied"
+
+    def __init__(
+        self,
+        name: str,
+        source: str,
+        region: str | None = "us-east",
+        is_sky_managed: bool | None = None,
+        sync_on_reconstruction: bool = True,
+    ):
+        self.client: storage.Client
+        self.bucket: StorageHandle
+        super().__init__(name, source, region, is_sky_managed, sync_on_reconstruction)
+        self.bucket_rclone_profile = Rclone.generate_rclone_bucket_profile_name(
+            self.name, Rclone.RcloneClouds.IBM
+        )
 
     def _validate(self):
         if self.source is not None and isinstance(self.source, str):
-            if self.source.startswith('s3://'):
+            if self.source.startswith("s3://"):
                 assert self.name == data_utils.split_s3_path(self.source)[0], (
-                    'S3 Bucket is specified as path, the name should be the'
-                    ' same as S3 bucket.')
+                    "S3 Bucket is specified as path, the name should be the"
+                    " same as S3 bucket."
+                )
                 assert data_utils.verify_s3_bucket(self.name), (
-                    f'Source specified as {self.source}, a S3 bucket. ',
-                    'S3 Bucket should exist.')
-            elif self.source.startswith('gs://'):
+                    f"Source specified as {self.source}, a S3 bucket. ",
+                    "S3 Bucket should exist.",
+                )
+            elif self.source.startswith("gs://"):
                 assert self.name == data_utils.split_gcs_path(self.source)[0], (
-                    'GCS Bucket is specified as path, the name should be '
-                    'the same as GCS bucket.')
+                    "GCS Bucket is specified as path, the name should be "
+                    "the same as GCS bucket."
+                )
                 assert data_utils.verify_gcs_bucket(self.name), (
-                    f'Source specified as {self.source}, a GCS bucket. ',
-                    'GCS Bucket should exist.')
-            elif self.source.startswith('r2://'):
+                    f"Source specified as {self.source}, a GCS bucket. ",
+                    "GCS Bucket should exist.",
+                )
+            elif self.source.startswith("r2://"):
                 assert self.name == data_utils.split_r2_path(self.source)[0], (
-                    'R2 Bucket is specified as path, the name should be '
-                    'the same as R2 bucket.')
+                    "R2 Bucket is specified as path, the name should be "
+                    "the same as R2 bucket."
+                )
                 assert data_utils.verify_r2_bucket(self.name), (
-                    f'Source specified as {self.source}, a R2 bucket. ',
-                    'R2 Bucket should exist.')
-            elif self.source.startswith('cos://'):
+                    f"Source specified as {self.source}, a R2 bucket. ",
+                    "R2 Bucket should exist.",
+                )
+            elif self.source.startswith("cos://"):
                 assert self.name == data_utils.split_cos_path(self.source)[0], (
-                    'COS Bucket is specified as path, the name should be '
-                    'the same as COS bucket.')
+                    "COS Bucket is specified as path, the name should be "
+                    "the same as COS bucket."
+                )
         # Validate name
         self.name = IBMCosStore.validate_name(self.name)
 
@@ -2361,36 +2496,40 @@ class IBMCosStore(AbstractStore):
         if name is not None and isinstance(name, str):
             if not 3 <= len(name) <= 63:
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: {name} must be between 3 (min) '
-                    'and 63 (max) characters long.')
+                    f"Invalid store name: {name} must be between 3 (min) "
+                    "and 63 (max) characters long."
+                )
 
             # Check for valid characters and start/end with a letter or number
-            pattern = r'^[a-z0-9][-a-z0-9.]*[a-z0-9]$'
+            pattern = r"^[a-z0-9][-a-z0-9.]*[a-z0-9]$"
             if not re.match(pattern, name):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: {name} can consist only of '
-                    'lowercase letters, numbers, dots (.), and dashes (-). '
-                    'It must begin and end with a letter or number.')
+                    f"Invalid store name: {name} can consist only of "
+                    "lowercase letters, numbers, dots (.), and dashes (-). "
+                    "It must begin and end with a letter or number."
+                )
 
             # Check for two adjacent periods or dashes
-            if any(substring in name for substring in ['..', '--']):
+            if any(substring in name for substring in ["..", "--"]):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: {name} must not contain '
-                    'two adjacent periods/dashes')
+                    f"Invalid store name: {name} must not contain "
+                    "two adjacent periods/dashes"
+                )
 
             # Check for IP address format
-            ip_pattern = r'^(?:\d{1,3}\.){3}\d{1,3}$'
+            ip_pattern = r"^(?:\d{1,3}\.){3}\d{1,3}$"
             if re.match(ip_pattern, name):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: {name} must not be formatted as '
-                    'an IP address (for example, 192.168.5.4).')
+                    f"Invalid store name: {name} must not be formatted as "
+                    "an IP address (for example, 192.168.5.4)."
+                )
 
-            if any(substring in name for substring in ['.-', '-.']):
+            if any(substring in name for substring in [".-", "-."]):
                 _raise_no_traceback_name_error(
-                    f'Invalid store name: {name} must '
-                    'not allow substrings: ".-", "-." .')
+                    f'Invalid store name: {name} must not allow substrings: ".-", "-.".'
+                )
         else:
-            _raise_no_traceback_name_error('Store name must be specified.')
+            _raise_no_traceback_name_error("Store name must be specified.")
         return name
 
     def initialize(self):
@@ -2427,36 +2566,42 @@ class IBMCosStore(AbstractStore):
             if isinstance(self.source, list):
                 self.batch_ibm_rsync(self.source, create_dirs=True)
             elif self.source is not None:
-                if self.source.startswith('cos://'):
+                if self.source.startswith("cos://"):
                     # cos bucket used as a dest, can't be used as source.
                     pass
-                elif self.source.startswith('s3://'):
-                    raise Exception('IBM COS currently not supporting'
-                                    'data transfers between COS and S3')
-                elif self.source.startswith('gs://'):
-                    raise Exception('IBM COS currently not supporting'
-                                    'data transfers between COS and GS')
-                elif self.source.startswith('r2://'):
-                    raise Exception('IBM COS currently not supporting'
-                                    'data transfers between COS and r2')
+                elif self.source.startswith("s3://"):
+                    raise Exception(
+                        "IBM COS currently not supporting data transfers between COS and S3"
+                    )
+                elif self.source.startswith("gs://"):
+                    raise Exception(
+                        "IBM COS currently not supporting data transfers between COS and GS"
+                    )
+                elif self.source.startswith("r2://"):
+                    raise Exception(
+                        "IBM COS currently not supporting data transfers between COS and r2"
+                    )
                 else:
                     self.batch_ibm_rsync([self.source])
 
         except Exception as e:
             raise exceptions.StorageUploadError(
-                f'Upload failed for store {self.name}') from e
+                f"Upload failed for store {self.name}"
+            ) from e
 
     def delete(self) -> None:
         self._delete_cos_bucket()
-        logger.info(f'{colorama.Fore.GREEN}Deleted COS bucket {self.name}.'
-                    f'{colorama.Style.RESET_ALL}')
+        logger.info(
+            f"{colorama.Fore.GREEN}Deleted COS bucket {self.name}."
+            f"{colorama.Style.RESET_ALL}"
+        )
 
     def get_handle(self) -> StorageHandle:
         return self.s3_resource.Bucket(self.name)
 
-    def batch_ibm_rsync(self,
-                        source_path_list: List[Path],
-                        create_dirs: bool = False) -> None:
+    def batch_ibm_rsync(
+        self, source_path_list: list[Path], create_dirs: bool = False
+    ) -> None:
         """Invokes rclone copy to batch upload a list of local paths to cos
 
         Since rclone does not support batch operations, we construct
@@ -2493,7 +2638,8 @@ class IBMCosStore(AbstractStore):
             sync_command = (
                 'rclone copy --exclude ".git/*" '
                 f'"{src_dir_path}" '
-                f'{self.bucket_rclone_profile}:{self.name}/{dest_dir_name}')
+                f"{self.bucket_rclone_profile}:{self.name}/{dest_dir_name}"
+            )
             return sync_command
 
         def get_file_sync_command(base_dir_path, file_names) -> str:
@@ -2514,23 +2660,27 @@ class IBMCosStore(AbstractStore):
             """
 
             # wrapping file_name with "" to support spaces
-            includes = ' '.join(
-                [f'--include "{file_name}"' for file_name in file_names])
-            sync_command = ('rclone copy '
-                            f'{includes} "{base_dir_path}" '
-                            f'{self.bucket_rclone_profile}:{self.name}')
+            includes = " ".join(
+                [f'--include "{file_name}"' for file_name in file_names]
+            )
+            sync_command = (
+                "rclone copy "
+                f'{includes} "{base_dir_path}" '
+                f"{self.bucket_rclone_profile}:{self.name}"
+            )
             return sync_command
 
         # Generate message for upload
         if len(source_path_list) > 1:
-            source_message = f'{len(source_path_list)} paths'
+            source_message = f"{len(source_path_list)} paths"
         else:
             source_message = source_path_list[0]
 
         with rich_utils.safe_status(
-                f'[bold cyan]Syncing '
-                f'[green]{source_message}[/] to '
-                f'[green]cos://{self.region}/{self.name}/[/]'):
+            f"[bold cyan]Syncing "
+            f"[green]{source_message}[/] to "
+            f"[green]cos://{self.region}/{self.name}/[/]"
+        ):
             data_utils.parallel_upload(
                 source_path_list,
                 get_file_sync_command,
@@ -2538,9 +2688,10 @@ class IBMCosStore(AbstractStore):
                 self.name,
                 self._ACCESS_DENIED_MESSAGE,
                 create_dirs=create_dirs,
-                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS)
+                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS,
+            )
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """returns IBM COS bucket object if exists, otherwise creates it.
 
         Returns:
@@ -2560,35 +2711,41 @@ class IBMCosStore(AbstractStore):
             bucket_region = data_utils.get_ibm_cos_bucket_region(self.name)
         except exceptions.StorageBucketGetError as e:
             with ux_utils.print_exception_no_traceback():
-                command = f'rclone lsd {bucket_profile_name}: '
+                command = f"rclone lsd {bucket_profile_name}: "
                 raise exceptions.StorageBucketGetError(
-                    _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name) +
-                    f' To debug, consider running `{command}`.') from e
+                    _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(name=self.name)
+                    + f" To debug, consider running `{command}`."
+                ) from e
 
         try:
-            uri_region = data_utils.split_cos_path(
-                self.source)[2]  # type: ignore
+            uri_region = data_utils.split_cos_path(self.source)[2]  # type: ignore
         except ValueError:
             # source isn't a cos uri
-            uri_region = ''
+            uri_region = ""
 
         # bucket's region doesn't match specified region in URI
-        if bucket_region and uri_region and uri_region != bucket_region\
-              and self.sync_on_reconstruction:
+        if (
+            bucket_region
+            and uri_region
+            and uri_region != bucket_region
+            and self.sync_on_reconstruction
+        ):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketGetError(
-                    f'Bucket {self.name} exists in '
-                    f'region {bucket_region}, '
-                    f'but URI specified region {uri_region}.')
+                    f"Bucket {self.name} exists in "
+                    f"region {bucket_region}, "
+                    f"but URI specified region {uri_region}."
+                )
 
         if not bucket_region and uri_region:
             # bucket doesn't exist but source is a bucket URI
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketGetError(
-                    'Attempted to use a non-existent bucket as a source: '
-                    f'{self.name} by providing URI. Consider using '
-                    '`rclone lsd <remote>` on relevant remotes returned '
-                    'via `rclone listremotes` to debug.')
+                    "Attempted to use a non-existent bucket as a source: "
+                    f"{self.name} by providing URI. Consider using "
+                    "`rclone lsd <remote>` on relevant remotes returned "
+                    "via `rclone listremotes` to debug."
+                )
 
         Rclone.store_rclone_config(
             self.name,
@@ -2603,8 +2760,8 @@ class IBMCosStore(AbstractStore):
             # delete or to re-mount Storages with sky start but the storage
             # is already removed externally.
             raise exceptions.StorageExternalDeletionError(
-                'Attempted to fetch a non-existent bucket: '
-                f'{self.name}')
+                f"Attempted to fetch a non-existent bucket: {self.name}"
+            )
         else:
             # bucket exists
             return self.s3_resource.Bucket(self.name), False
@@ -2635,22 +2792,20 @@ class IBMCosStore(AbstractStore):
         )
         # pylint: disable=line-too-long
         # creates a fusermount soft link on older (<22) Ubuntu systems for rclone's mount utility.
-        create_fuser3_soft_link = '[ ! -f /bin/fusermount3 ] && sudo ln -s /bin/fusermount /bin/fusermount3 || true'
+        create_fuser3_soft_link = "[ ! -f /bin/fusermount3 ] && sudo ln -s /bin/fusermount /bin/fusermount3 || true"
         # stores bucket profile in rclone config file at the cluster's nodes.
-        configure_rclone_profile = (
-            f'{create_fuser3_soft_link}; mkdir -p ~/.config/rclone/ && echo "{rclone_config_data}">> {Rclone.RCLONE_CONFIG_PATH}'
-        )
+        configure_rclone_profile = f'{create_fuser3_soft_link}; mkdir -p ~/.config/rclone/ && echo "{rclone_config_data}" >> {Rclone.RCLONE_CONFIG_PATH}'
         # install rclone if not installed.
-        install_cmd = 'rclone version >/dev/null 2>&1 || (curl https://rclone.org/install.sh | sudo bash)'
+        install_cmd = "rclone version >/dev/null 2>&1 || (curl https://rclone.org/install.sh | sudo bash)"
         # --daemon will keep the mounting process running in the background.
-        mount_cmd = f'{configure_rclone_profile} && rclone mount {self.bucket_rclone_profile}:{self.bucket.name} {mount_path} --daemon'
-        return mounting_utils.get_mounting_command(StorageMode.MOUNT,
-                                                   mount_path, mount_cmd,
-                                                   install_cmd)
+        mount_cmd = f"{configure_rclone_profile} && rclone mount {self.bucket_rclone_profile}:{self.bucket.name} {mount_path} --daemon"
+        return mounting_utils.get_mounting_command(
+            StorageMode.MOUNT, mount_path, mount_cmd, install_cmd
+        )
 
-    def csync_command(self,
-                      csync_path: str,
-                      interval_seconds: Optional[int] = None) -> str:
+    def csync_command(
+        self, csync_path: str, interval_seconds: int | None = None
+    ) -> str:
         """Returns command to mount CSYNC with Storage bucket on CSYNC_PATH.
 
         Args:
@@ -2659,9 +2814,7 @@ class IBMCosStore(AbstractStore):
         """
         raise NotImplementedError
 
-    def _create_cos_bucket(self,
-                           bucket_name: str,
-                           region='us-east') -> StorageHandle:
+    def _create_cos_bucket(self, bucket_name: str, region="us-east") -> StorageHandle:
         """Creates IBM COS bucket with specific name in specific region
 
         Args:
@@ -2673,20 +2826,21 @@ class IBMCosStore(AbstractStore):
         try:
             self.client.create_bucket(
                 Bucket=bucket_name,
-                CreateBucketConfiguration={
-                    'LocationConstraint': f'{region}-smart'
-                })
-            logger.info(f'Created IBM COS bucket {bucket_name} in {region} '
-                        f'with storage class smart tier')
+                CreateBucketConfiguration={"LocationConstraint": f"{region}-smart"},
+            )
+            logger.info(
+                f"Created IBM COS bucket {bucket_name} in {region} "
+                f"with storage class smart tier"
+            )
             self.bucket = self.s3_resource.Bucket(bucket_name)
 
         except ibm.ibm_botocore.exceptions.ClientError as e:  # type: ignore[union-attr]  # pylint: disable=line-too-long
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketCreateError(
-                    f'Failed to create bucket: '
-                    f'{bucket_name}') from e
+                    f"Failed to create bucket: {bucket_name}"
+                ) from e
 
-        s3_bucket_exists_waiter = self.client.get_waiter('bucket_exists')
+        s3_bucket_exists_waiter = self.client.get_waiter("bucket_exists")
         s3_bucket_exists_waiter.wait(Bucket=bucket_name)
 
         return self.bucket
@@ -2695,14 +2849,14 @@ class IBMCosStore(AbstractStore):
         bucket = self.s3_resource.Bucket(self.name)
         try:
             bucket_versioning = self.s3_resource.BucketVersioning(self.name)
-            if bucket_versioning.status == 'Enabled':
+            if bucket_versioning.status == "Enabled":
                 res = list(bucket.object_versions.delete())
             else:
                 res = list(bucket.objects.delete())
-            logger.debug(f'Deleted bucket\'s content:\n{res}')
+            logger.debug(f"Deleted bucket's content:\n{res}")
             bucket.delete()
             bucket.wait_until_not_exists()
         except ibm.ibm_botocore.exceptions.ClientError as e:
-            if e.__class__.__name__ == 'NoSuchBucket':
-                logger.debug('bucket already removed')
+            if e.__class__.__name__ == "NoSuchBucket":
+                logger.debug("bucket already removed")
         Rclone.delete_rclone_bucket_profile(self.name, Rclone.RcloneClouds.IBM)
