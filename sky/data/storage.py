@@ -697,7 +697,7 @@ class Storage(object):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageSourceError(
                     'The field "interval_seconds" can be specified only '
-                    'with CSYNC mdoe.')
+                    'with CSYNC mode.')
 
         if self.source is None:
             # If the mode is COPY, the source must be specified
@@ -819,7 +819,7 @@ class Storage(object):
         source = override_args.get('source', metadata.source)
         name = override_args.get('name', metadata.storage_name)
         # If the source is a list, it consists of local paths
-        if not isinstance(source, list): 
+        if not isinstance(source, list):
             if data_utils.is_cloud_store_url(source):
                 name = None
 
